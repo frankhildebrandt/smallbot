@@ -12,6 +12,9 @@ export interface ManagedModuleConfig {
   entryScript: string;
   capabilities?: string[];
   env?: Record<string, string>;
+  permissions: {
+    networking: boolean;
+  };
 }
 
 interface ManagedChild {
@@ -90,6 +93,7 @@ export class SubprocessManager {
         SERVICE_KIND: config.kind,
         ...config.env,
       },
+      permissions: config.permissions,
       mode: this.sandboxMode,
     });
 

@@ -9,6 +9,14 @@ Jedes Modul liegt unter `module/<name>` und besitzt:
 - eigenen TypeScript-Build
 - eigenen Runtime-Einstiegspunkt
 
+Die Root-Konfiguration verweist Module ueber `settings.yml` mit:
+
+- `module: "<name>"` fuer `module/<name>/dist/index.js`
+- `name` als Service-Name
+- `kind` fuer Discovery und `SERVICE_KIND`
+- `permissions.networking`
+- optional `environment`
+
 ## Startparameter
 
 Die Root-Anwendung uebergibt Startparameter ueber Environment-Variablen:
@@ -18,6 +26,8 @@ Die Root-Anwendung uebergibt Startparameter ueber Environment-Variablen:
 - `MANAGER_SOCKET_PATH`
 - `LISTEN_SOCKET_PATH`
 - `DATA_PATH`
+
+Zusaetzlich werden Eintraege aus `services[].environment` unveraendert an den Modulprozess weitergegeben.
 
 ## Kommunikations-Framework
 

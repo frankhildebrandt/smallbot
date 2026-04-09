@@ -12,16 +12,44 @@ export interface SpawnIsolatedNodeOptions {
   dataPath: string;
   env?: Record<string, string>;
   mode?: SandboxMode;
+  permissions: ServicePermissions;
+}
+
+export interface ServicePermissions {
+  networking: boolean;
 }
 
 export async function spawnIsolatedNode(options: SpawnIsolatedNodeOptions): Promise<ChildProcess> {
-  const mode = await resolveSandboxMode(options.mode ?? "auto");
+  const mode = await resolveSandboxMode(options.mode ?? "auto", options.permissions);
 
   return mode === "bwrap" ? spawnWithBubblewrap(options) : spawnDirectNode(options);
 }
 
-async function resolveSandboxMode(mode: SandboxMode): Promise<Exclude<SandboxMode, "auto">> {
+export async function resolveSandboxMode(
+  mode: SandboxMode,
+  permissions: ServicePermissions,
+): Promise<Exclude<SandboxMode, "auto">> {
+  if (!permissions.networking) {
+    if (process.platform !== "linux") {
+      throw new Error("permissions.networking=false requires Linux bubblewrap isolation");
+    }
+
+    if (!(await hasBubblewrap())) {
+      throw new Error("permissions.networking=false requires bubblewrap to be installed");
+    }
+
+    return "bwrap";
+  }
+
   if (mode === "process" || mode === "bwrap") {
+    if (mode === "bwrap" && process.platform === "linux" && !(await hasBubblewrap())) {
+      throw new Error("sandboxMode=bwrap requires bubblewrap to be installed");
+    }
+
+    if (mode === "bwrap" && process.platform !== "linux") {
+      throw new Error("sandboxMode=bwrap is only supported on Linux");
+    }
+
     return mode;
   }
 
@@ -73,6 +101,7 @@ function spawnWithBubblewrap({
   listenSocketPath,
   dataPath,
   env = {},
+  permissions,
 }: SpawnIsolatedNodeOptions): ChildProcess {
   const appDir = path.dirname(path.resolve(scriptPath));
   const nodeBinary = process.execPath;
@@ -80,6 +109,7 @@ function spawnWithBubblewrap({
   const args = [
     "--unshare-pid",
     "--unshare-ipc",
+    ...(permissions.networking ? [] : ["--unshare-net"]),
     "--die-with-parent",
     "--clearenv",
     "--proc",
