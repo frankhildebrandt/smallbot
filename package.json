@@ -1,0 +1,16 @@
+{
+  "name": "smallbot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "postinstall": "npm install --prefix packages/framework && npm run build --prefix packages/framework && npm install --prefix module/ai-free",
+    "build": "tsc -p tsconfig.json && npm run build --prefix packages/framework && npm install --prefix module/ai-free --silent && npm run build --prefix module/ai-free",
+    "start": "npm run build --silent && node dist/index.js",
+    "test": "npm run build --silent && node --test dist/test/**/*.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "typescript": "^5.8.3"
+  }
+}
