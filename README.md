@@ -1,33 +1,50 @@
 # SmallBot
 
-SmallBot ist ein in TypeScript entwickelter KI-Bot. *(Genauere Funktionalität oder Anwendungsbereich ist bisher nicht spezifiziert.)*
+SmallBot ist ein leichtgewichtiges TypeScript-Basisprojekt fuer einen JSON-basierten Message Broker mit Service Discovery und einem Subprozess-Manager fuer isolierte Module.
 
-## Setup
+## Schnellstart
 
-1. Klonen Sie das Repository:
-   ```bash
-   git clone https://github.com/yourusername/smallbot.git
-   cd smallbot
-   ```
+```bash
+npm install
+npm run start
+```
 
-2. Installieren Sie die Abhängigkeiten:
-   ```bash
-   npm install
-   ```
+Der Start-Workflow kompiliert zuerst alle TypeScript-Pakete mit `tsc` und startet danach den Broker. Standardmaessig wird ein Beispielmodul `ai:1` geladen.
 
-3. Starten Sie den Bot:
-   ```bash
-   npm start
-   ```
+## Kernideen
 
-## Nutzung
+- kompakte JSON-Nachrichten mit den Feldern `s`, `t`, `m`, `c`, `i`
+- optionales Routing ueber `v` und `n`
+- Service Discovery ueber `d` und `q`
+- Subprozess-Manager mit Bubblewrap-Sandbox im Devcontainer
+- wiederverwendbares Kommunikations-Framework unter `packages/framework`
+- Module als eigenstaendige TypeScript-Pakete unter `module/<name>`
 
-*(Konkrete Nutzungshinweise folgen sobald die Funktionalität des Bots definiert ist.)*
+## Struktur
 
-## Nächste Schritte
+| Pfad | Inhalt |
+| --- | --- |
+| `src/` | Broker, Discovery, Prozess-Manager und App-Start |
+| `packages/framework/` | NPM-Framework fuer Modul-Kommunikation |
+| `module/ai-free/` | Beispielmodul fuer freie AI-Inference |
+| `docs/` | Architektur-, Protokoll- und Betriebsdokumentation |
+| `.devcontainer/` | Devcontainer-Setup mit Node.js und Bubblewrap |
 
-- [ ] Detaillierte Funktionalität des Bots definieren
-- [ ] Benutzungshinweise und Beispiele ergänzen
-- [ ] Erweiterung der Dokumentation
+## Konfiguration
 
-Falls Sie Fragen oder Anregungen haben, zögern Sie nicht, ein Issue zu erstellen oder einen Pull Request zu senden!
+Die Anwendung wird ueber Umgebungsvariablen gesteuert:
+
+| Variable | Standard | Bedeutung |
+| --- | --- | --- |
+| `SMALLBOT_RUNTIME_DIR` | `.runtime` | Laufzeitdaten, Sockets und persistente Modul-Daten |
+| `SMALLBOT_SOCKET_DIR` | system temp dir | Kurzer Unix-Socket-Pfad fuer Broker und Module |
+| `SMALLBOT_SANDBOX_MODE` | `auto` | `auto`, `bwrap` oder `process` |
+| `SMALLBOT_DISABLE_MODULES` | `0` | Beispielmodule beim Start ueberspringen |
+| `SMALLBOT_AI_MODULE_PATH` | `module/ai-free/dist/index.js` | Einstiegspunkt des Beispielmoduls |
+| `SMALLBOT_DEFAULT_AI_NAME` | `ai:1` | Service-Name des Beispielmoduls |
+
+## Dokumentation
+
+- `docs/architecture.md`
+- `docs/protocol.md`
+- `docs/modules.md`
