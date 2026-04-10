@@ -28,6 +28,7 @@ Die Root-Anwendung uebergibt Startparameter ueber Environment-Variablen:
 - `DATA_PATH`
 
 Zusaetzlich werden Eintraege aus `services[].environment` unveraendert an den Modulprozess weitergegeben.
+Darueber koennen Module auch Laufzeit-Features schalten, etwa einzelne `task-worker`-AI-Tools ueber `WORKER_TOOL_<NAME>_ENABLED=true|false`.
 
 ## Kommunikations-Framework
 

@@ -8,7 +8,7 @@ import test from "node:test";
 import { WireMessage } from "@smallbot/framework";
 
 import { TaskWorkerService } from "./TaskWorkerService.js";
-import { WorkerRuntime } from "./contracts.js";
+import { WorkerRuntime } from "../contracts.js";
 
 class RuntimeStub implements WorkerRuntime {
   readonly sent: WireMessage[] = [];
@@ -33,9 +33,40 @@ async function createDataDir(): Promise<string> {
   return mkdtemp(path.join(os.tmpdir(), "smallbot-task-worker-"));
 }
 
+function createTasksJson(tasks: Array<{ id: string; title: string; status: "open" | "done" }>): string {
+  return JSON.stringify({ tasks }, null, 2);
+}
+
+function convertTodoLikeInput(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed.startsWith("# TODO")) {
+    return input;
+  }
+
+  const lines = trimmed.split(/\r?\n/).slice(1).filter((line) => line.trim().length > 0);
+  const tasks = lines.map((line, index) => {
+    const match = line.match(/^- \[( |x)\] (.+)$/);
+    if (!match) {
+      return null;
+    }
+
+    return {
+      id: `task-${index + 1}`,
+      title: match[2]!,
+      status: match[1] === "x" ? "done" as const : "open" as const,
+    };
+  });
+
+  if (tasks.some((task) => task === null)) {
+    return input;
+  }
+
+  return createTasksJson(tasks as Array<{ id: string; title: string; status: "open" | "done" }>);
+}
+
 function createAiFiles(
   appContent: string,
-  todoContent = "# TODO\n- [x] Review existing app\n",
+  tasksContent = createTasksJson([{ id: "task-1", title: "Review existing app", status: "done" }]),
 ): Array<{ path: string; content: string }> {
   return [
     {
@@ -43,8 +74,8 @@ function createAiFiles(
       content: appContent,
     },
     {
-      path: "todo.md",
-      content: todoContent,
+      path: "tasks.json",
+      content: convertTodoLikeInput(tasksContent),
     },
   ];
 }
@@ -54,48 +85,9 @@ async function waitForAiTool(runtime: RuntimeStub, count: number, target = "ai:1
   return runtime.sent.filter((message) => message.t === target && message.c === "tool")[count - 1]!;
 }
 
-async function replyWithTodoPlan(
-  service: TaskWorkerService,
-  request: WireMessage,
-  target = "ai:1",
-  todo = "# TODO\n- [x] Review existing app\n",
-): Promise<void> {
-  await service.onMessage({
-    s: target,
-    t: "worker:1",
-    c: "result",
-    i: request.i,
-    m: {
-      todo,
-    },
-  });
-}
-
 function enableAutoTodoPlanner(service: TaskWorkerService, runtime: RuntimeStub): void {
-  runtime.onSend = (message) => {
-    if (message.c !== "tool" || typeof message.t !== "string" || !message.t.startsWith("ai:")) {
-      return true;
-    }
-
-    const payload = JSON.stringify(message.m);
-    if (!payload.includes("Return only todo.md content")) {
-      return true;
-    }
-
-    queueMicrotask(() => {
-      void service.onMessage({
-        s: message.t!,
-        t: "worker:1",
-        c: "result",
-        i: message.i,
-        m: {
-          todo: "# TODO\n- [x] Review existing app\n",
-        },
-      });
-    });
-
-    return false;
-  };
+  void service;
+  void runtime;
 }
 
 test("worker reports missing task.md and returns to free", async (t) => {
@@ -162,7 +154,62 @@ test("worker uses an existing app first when it already solves the task", async 
 
   assert.equal(runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool").length, 1);
   assert.match(await readFile(path.join(dataPath, "result.json"), "utf8"), /existing app worked/);
-  await assert.rejects(access(path.join(dataPath, "todo.md")));
+  await assert.rejects(access(path.join(dataPath, "tasks.json")));
+});
+
+test("worker verification for an existing service app includes observed service output when no result file exists", async (t) => {
+  const dataPath = await createDataDir();
+  const runtime = new RuntimeStub("worker:1");
+  const service = new TaskWorkerService(runtime, { dataPath, aiKind: "ai", aiTarget: "ai:1" });
+  enableAutoTodoPlanner(service, runtime);
+
+  await mkdir(path.join(dataPath, "app"), { recursive: true });
+  await writeFile(path.join(dataPath, "task.md"), "reuse existing service app", "utf8");
+  await writeFile(path.join(dataPath, "app", "index.ts"), `export default async function run(host) {
+  await host.serveHttp({
+    host: "127.0.0.1",
+    port: 5080,
+    fetch: async () => new Response("service says hello", {
+      status: 200,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+    }),
+  });
+  await host.markReady({ summary: "ready on 127.0.0.1:5080", host: "127.0.0.1", port: 5080 });
+}
+`, "utf8");
+
+  t.after(async () => {
+    await rm(dataPath, { recursive: true, force: true });
+  });
+
+  const runPromise = service.onMessage({
+    s: "agent:1",
+    t: "worker:1",
+    c: "tool",
+    i: "req-existing-service-1",
+  });
+
+  const verificationRequest = await waitForAiTool(runtime, 1);
+  const verificationPayload = JSON.stringify(verificationRequest.m);
+  assert.match(verificationPayload, /ready on 127\.0\.0\.1:5080/);
+  assert.match(verificationPayload, /export default async function run\(host\)/);
+  assert.match(verificationPayload, /appSource/);
+  assert.match(verificationPayload, /service says hello/);
+  assert.match(verificationPayload, /observedStatus/);
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: verificationRequest.i,
+    m: { answer: "VALID: existing service app already solved the task" },
+  });
+
+  await runPromise;
+
+  assert.equal(runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool").length, 1);
+  assert.match(await readFile(path.join(dataPath, "result.json"), "utf8"), /existing service app already solved the task/);
+  await assert.rejects(access(path.join(dataPath, "tasks.json")));
 });
 
 test("worker generates app, writes progress and completes task", async (t) => {
@@ -226,6 +273,600 @@ test("worker generates app, writes progress and completes task", async (t) => {
   assert.match(await readFile(path.join(dataPath, "result.json"), "utf8"), /"success": true/);
   assert.match(await readFile(path.join(dataPath, "result.json"), "utf8"), /Verification: result matches task/);
   assert.equal(await readFile(path.join(dataPath, "result.md"), "utf8"), "# SOLVE\nWRITE MEMORY AND RESULT\n");
+});
+
+test("worker executes AI file tools during iteration while task tracking stays worker-managed", async (t) => {
+  const dataPath = await createDataDir();
+  const runtime = new RuntimeStub("worker:1");
+  const service = new TaskWorkerService(runtime, { dataPath, aiKind: "ai", aiTarget: "ai:1" });
+
+  await writeFile(path.join(dataPath, "task.md"), "build a tiny api", "utf8");
+
+  t.after(async () => {
+    await rm(dataPath, { recursive: true, force: true });
+  });
+
+  const runPromise = service.onMessage({
+    s: "agent:1",
+    t: "worker:1",
+    c: "tool",
+    i: "req-tool-loop-1",
+  });
+
+  const iterationRequest = await waitForAiTool(runtime, 1);
+  assert.equal((iterationRequest.m as { type?: string }).type, "tool_use");
+
+  const appSource = `export default async function run(host) {
+  await host.writeFile("result.md", "ok");
+  await host.completeTask({ summary: "api ready", resultFile: "result.md" });
+}
+`;
+  const completedTasks = createTasksJson([{ id: "task-1", title: "Build tiny API", status: "done" }]);
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: iterationRequest.i,
+    m: {
+      message: {
+        role: "assistant",
+        toolCalls: [
+          {
+            id: "iter-write-app",
+            type: "function",
+            name: "write_file",
+            arguments: JSON.stringify({ path: "app/index.ts", content: appSource }),
+          },
+        ],
+      },
+      toolCalls: [
+        {
+          id: "iter-write-app",
+          type: "function",
+          name: "write_file",
+          arguments: JSON.stringify({ path: "app/index.ts", content: appSource }),
+        },
+      ],
+    },
+  });
+
+  const iterationFollowUp = await waitForAiTool(runtime, 2);
+  assert.match(JSON.stringify(iterationFollowUp.m), /"toolCallId":"iter-write-app"/);
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: iterationFollowUp.i,
+    m: {
+      answer: JSON.stringify({
+        decision: "test",
+        summary: "implemented tiny api",
+        tasks: JSON.parse(completedTasks).tasks,
+      }),
+    },
+  });
+
+  const verificationRequest = await waitForAiTool(runtime, 3);
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: verificationRequest.i,
+    m: { answer: "VALID: task solved" },
+  });
+
+  await runPromise;
+
+  assert.equal(await readFile(path.join(dataPath, "app", "index.ts"), "utf8"), appSource);
+  assert.equal(await readFile(path.join(dataPath, "tasks.json"), "utf8"), completedTasks);
+  const toolsLog = await readFile(path.join(dataPath, "logs", "tools.log"), "utf8");
+  assert.match(toolsLog, /tool=write_file/);
+  assert.equal(await readFile(path.join(dataPath, "result.md"), "utf8"), "ok");
+});
+
+test("worker omits execute_typescript from iteration tools when disabled in config", async (t) => {
+  const dataPath = await createDataDir();
+  const runtime = new RuntimeStub("worker:1");
+  const service = new TaskWorkerService(runtime, {
+    dataPath,
+    aiKind: "ai",
+    aiTarget: "ai:1",
+    enabledTools: {
+      execute_typescript: false,
+    },
+  });
+
+  await writeFile(path.join(dataPath, "task.md"), "build a tiny api", "utf8");
+
+  t.after(async () => {
+    await rm(dataPath, { recursive: true, force: true });
+  });
+
+  const runPromise = service.onMessage({
+    s: "agent:1",
+    t: "worker:1",
+    c: "tool",
+    i: "req-disabled-execute-typescript",
+  });
+
+  const iterationRequest = await waitForAiTool(runtime, 1);
+  const requestPayload = JSON.stringify(iterationRequest.m);
+
+  assert.doesNotMatch(requestPayload, /"name":"execute_typescript"/);
+  assert.doesNotMatch(requestPayload, /execute_typescript\(script\)/);
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: iterationRequest.i,
+    m: {
+      files: createAiFiles(`export default async function run(host) {
+  await host.writeFile("result.md", "ok");
+  await host.completeTask({ summary: "done", resultFile: "result.md" });
+}
+`),
+    },
+  });
+
+  const verificationRequest = await waitForAiTool(runtime, 2);
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: verificationRequest.i,
+    m: { answer: "VALID: task solved" },
+  });
+
+  await runPromise;
+});
+
+test("worker omits web_search from iteration tools when disabled in config", async (t) => {
+  const dataPath = await createDataDir();
+  const runtime = new RuntimeStub("worker:1");
+  const service = new TaskWorkerService(runtime, {
+    dataPath,
+    aiKind: "ai",
+    aiTarget: "ai:1",
+    enabledTools: {
+      web_search: false,
+    },
+  });
+
+  await writeFile(path.join(dataPath, "task.md"), "build a tiny api", "utf8");
+
+  t.after(async () => {
+    await rm(dataPath, { recursive: true, force: true });
+  });
+
+  const runPromise = service.onMessage({
+    s: "agent:1",
+    t: "worker:1",
+    c: "tool",
+    i: "req-disabled-web-search",
+  });
+
+  const iterationRequest = await waitForAiTool(runtime, 1);
+  const requestPayload = JSON.stringify(iterationRequest.m);
+
+  assert.doesNotMatch(requestPayload, /"name":"web_search"/);
+  assert.doesNotMatch(requestPayload, /web_search\(query\)/);
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: iterationRequest.i,
+    m: {
+      files: createAiFiles(`export default async function run(host) {
+  await host.writeFile("result.md", "ok");
+  await host.completeTask({ summary: "done", resultFile: "result.md" });
+}
+`),
+    },
+  });
+
+  const verificationRequest = await waitForAiTool(runtime, 2);
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: verificationRequest.i,
+    m: { answer: "VALID: task solved" },
+  });
+
+  await runPromise;
+});
+
+test("worker iteration read_file reports missing app files without aborting the run", async (t) => {
+  const dataPath = await createDataDir();
+  const runtime = new RuntimeStub("worker:1");
+  const service = new TaskWorkerService(runtime, { dataPath, aiKind: "ai", aiTarget: "ai:1" });
+
+  await writeFile(path.join(dataPath, "task.md"), "build a tiny api", "utf8");
+
+  t.after(async () => {
+    await rm(dataPath, { recursive: true, force: true });
+  });
+
+  const runPromise = service.onMessage({
+    s: "agent:1",
+    t: "worker:1",
+    c: "tool",
+    i: "req-missing-app-read-1",
+  });
+
+  const iterationRequest = await waitForAiTool(runtime, 1);
+  assert.equal((iterationRequest.m as { type?: string }).type, "tool_use");
+  assert.doesNotMatch(JSON.stringify(iterationRequest.m), /"app\/index\.ts"/);
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: iterationRequest.i,
+    m: {
+      message: {
+        role: "assistant",
+        toolCalls: [
+          {
+            id: "iter-read-app",
+            type: "function",
+            name: "read_file",
+            arguments: JSON.stringify({ path: "app/index.ts" }),
+          },
+        ],
+      },
+    },
+  });
+
+  const readFollowUp = await waitForAiTool(runtime, 2);
+  const readFollowUpPayload = JSON.stringify(readFollowUp.m);
+  assert.match(readFollowUpPayload, /"toolCallId":"iter-read-app"/);
+  assert.match(readFollowUpPayload, /\\"exists\\": false/);
+
+  const appSource = `export default async function run(host) {
+  await host.writeFile("result.md", "ok");
+  await host.completeTask({ summary: "api ready", resultFile: "result.md" });
+}
+`;
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: readFollowUp.i,
+    m: {
+      message: {
+        role: "assistant",
+        toolCalls: [
+          {
+            id: "iter-write-app",
+            type: "function",
+            name: "write_file",
+            arguments: JSON.stringify({ path: "app/index.ts", content: appSource }),
+          },
+        ],
+      },
+    },
+  });
+
+  const writeFollowUp = await waitForAiTool(runtime, 3);
+  assert.match(JSON.stringify(writeFollowUp.m), /"toolCallId":"iter-write-app"/);
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: writeFollowUp.i,
+    m: {
+      answer: JSON.stringify({
+        decision: "test",
+        summary: "implemented tiny api",
+        tasks: [{ id: "task-1", title: "Build tiny API", status: "done" }],
+      }),
+    },
+  });
+
+  const verificationRequest = await waitForAiTool(runtime, 4);
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: verificationRequest.i,
+    m: { answer: "VALID: task solved" },
+  });
+
+  await runPromise;
+
+  assert.equal(await readFile(path.join(dataPath, "app", "index.ts"), "utf8"), appSource);
+  assert.equal(await readFile(path.join(dataPath, "result.md"), "utf8"), "ok");
+});
+
+test("worker execute_typescript can write files through its helper context", async (t) => {
+  const dataPath = await createDataDir();
+  const runtime = new RuntimeStub("worker:1");
+  const service = new TaskWorkerService(runtime, { dataPath, aiKind: "ai", aiTarget: "ai:1" });
+
+  await writeFile(path.join(dataPath, "task.md"), "build via execute_typescript", "utf8");
+
+  t.after(async () => {
+    await rm(dataPath, { recursive: true, force: true });
+  });
+
+  const runPromise = service.onMessage({
+    s: "agent:1",
+    t: "worker:1",
+    c: "tool",
+    i: "req-execute-typescript-1",
+  });
+
+  const iterationRequest = await waitForAiTool(runtime, 1);
+  assert.equal((iterationRequest.m as { type?: string }).type, "tool_use");
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: iterationRequest.i,
+    m: {
+      message: {
+        role: "assistant",
+        toolCalls: [
+          {
+            id: "iter-execute-ts",
+            type: "function",
+            name: "execute_typescript",
+            arguments: JSON.stringify({
+              script: `export default async function run(context) {
+  await context.writeTextFile("generated.txt", "hello from ts");
+  return { created: "generated.txt" };
+}`,
+            }),
+          },
+          {
+            id: "iter-write-app",
+            type: "function",
+            name: "write_file",
+            arguments: JSON.stringify({
+              path: "app/index.ts",
+              content: `export default async function run(host) {
+  const generated = await host.readFile("generated.txt");
+  await host.writeFile("result.md", generated);
+  await host.completeTask({ summary: "used execute_typescript", resultFile: "result.md" });
+}
+`,
+            }),
+          },
+        ],
+      },
+    },
+  });
+
+  const followUp = await waitForAiTool(runtime, 2);
+  const followUpPayload = JSON.stringify(followUp.m);
+  assert.match(followUpPayload, /"toolCallId":"iter-execute-ts"/);
+  assert.match(followUpPayload, /"toolCallId":"iter-write-app"/);
+  assert.match(followUpPayload, /\\"created\\":\s*\\"generated\.txt\\"/);
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: followUp.i,
+    m: {
+      answer: JSON.stringify({
+        decision: "test",
+        summary: "generated support file and wired app",
+        tasks: [{ id: "task-1", title: "Generate output", status: "done" }],
+      }),
+    },
+  });
+
+  const verificationRequest = await waitForAiTool(runtime, 3);
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: verificationRequest.i,
+    m: { answer: "VALID: task solved" },
+  });
+
+  await runPromise;
+
+  assert.equal(await readFile(path.join(dataPath, "generated.txt"), "utf8"), "hello from ts");
+  assert.equal(await readFile(path.join(dataPath, "result.md"), "utf8"), "hello from ts");
+  const toolsLog = await readFile(path.join(dataPath, "logs", "tools.log"), "utf8");
+  assert.match(toolsLog, /tool=execute_typescript/);
+});
+
+test("worker execute_typescript can run shell commands from TypeScript", async (t) => {
+  const dataPath = await createDataDir();
+  const runtime = new RuntimeStub("worker:1");
+  const service = new TaskWorkerService(runtime, { dataPath, aiKind: "ai", aiTarget: "ai:1" });
+
+  await writeFile(path.join(dataPath, "task.md"), "run shell from execute_typescript", "utf8");
+
+  t.after(async () => {
+    await rm(dataPath, { recursive: true, force: true });
+  });
+
+  const runPromise = service.onMessage({
+    s: "agent:1",
+    t: "worker:1",
+    c: "tool",
+    i: "req-execute-typescript-2",
+  });
+
+  const iterationRequest = await waitForAiTool(runtime, 1);
+  assert.equal((iterationRequest.m as { type?: string }).type, "tool_use");
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: iterationRequest.i,
+    m: {
+      message: {
+        role: "assistant",
+        toolCalls: [
+          {
+            id: "iter-shell-ts",
+            type: "function",
+            name: "execute_typescript",
+            arguments: JSON.stringify({
+              script: `export default async function run(context) {
+  const { stdout } = await context.exec("node -e \\"process.stdout.write('shell ok')\\"");
+  await context.writeTextFile("shell.txt", stdout);
+  return { stdout };
+}`,
+            }),
+          },
+          {
+            id: "iter-write-app",
+            type: "function",
+            name: "write_file",
+            arguments: JSON.stringify({
+              path: "app/index.ts",
+              content: `export default async function run(host) {
+  const shell = await host.readFile("shell.txt");
+  await host.writeFile("result.md", shell);
+  await host.completeTask({ summary: "shell command executed", resultFile: "result.md" });
+}
+`,
+            }),
+          },
+        ],
+      },
+    },
+  });
+
+  const followUp = await waitForAiTool(runtime, 2);
+  const followUpPayload = JSON.stringify(followUp.m);
+  assert.match(followUpPayload, /"toolCallId":"iter-shell-ts"/);
+  assert.match(followUpPayload, /\\"stdout\\":\s*\\"shell ok\\"/);
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: followUp.i,
+    m: {
+      answer: JSON.stringify({
+        decision: "test",
+        summary: "ran shell command through execute_typescript",
+        tasks: [{ id: "task-1", title: "Run shell command", status: "done" }],
+      }),
+    },
+  });
+
+  const verificationRequest = await waitForAiTool(runtime, 3);
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: verificationRequest.i,
+    m: { answer: "VALID: task solved" },
+  });
+
+  await runPromise;
+
+  assert.equal(await readFile(path.join(dataPath, "shell.txt"), "utf8"), "shell ok");
+  assert.equal(await readFile(path.join(dataPath, "result.md"), "utf8"), "shell ok");
+});
+
+test("worker execute_typescript returns script errors to the AI without aborting the run", async (t) => {
+  const dataPath = await createDataDir();
+  const runtime = new RuntimeStub("worker:1");
+  const service = new TaskWorkerService(runtime, { dataPath, aiKind: "ai", aiTarget: "ai:1" });
+
+  await writeFile(path.join(dataPath, "task.md"), "handle execute_typescript failures", "utf8");
+
+  t.after(async () => {
+    await rm(dataPath, { recursive: true, force: true });
+  });
+
+  const runPromise = service.onMessage({
+    s: "agent:1",
+    t: "worker:1",
+    c: "tool",
+    i: "req-execute-typescript-error-1",
+  });
+
+  const iterationRequest = await waitForAiTool(runtime, 1);
+  assert.equal((iterationRequest.m as { type?: string }).type, "tool_use");
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: iterationRequest.i,
+    m: {
+      message: {
+        role: "assistant",
+        toolCalls: [
+          {
+            id: "iter-error-ts",
+            type: "function",
+            name: "execute_typescript",
+            arguments: JSON.stringify({
+              script: `export default async function run() {
+  throw new Error("boom from ts");
+}`,
+            }),
+          },
+          {
+            id: "iter-write-app",
+            type: "function",
+            name: "write_file",
+            arguments: JSON.stringify({
+              path: "app/index.ts",
+              content: `export default async function run(host) {
+  await host.writeFile("result.md", "tool error was handled");
+  await host.completeTask({ summary: "continued after execute_typescript error", resultFile: "result.md" });
+}
+`,
+            }),
+          },
+        ],
+      },
+    },
+  });
+
+  const followUp = await waitForAiTool(runtime, 2);
+  const followUpPayload = JSON.stringify(followUp.m);
+  assert.match(followUpPayload, /"toolCallId":"iter-error-ts"/);
+  assert.match(followUpPayload, /\\"ok\\":\s*false/);
+  assert.match(followUpPayload, /\\"message\\":\s*\\"boom from ts\\"/);
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: followUp.i,
+    m: {
+      answer: JSON.stringify({
+        decision: "test",
+        summary: "handled execute_typescript error and continued",
+        tasks: [{ id: "task-1", title: "Handle tool error", status: "done" }],
+      }),
+    },
+  });
+
+  const verificationRequest = await waitForAiTool(runtime, 3);
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: verificationRequest.i,
+    m: { answer: "VALID: task solved" },
+  });
+
+  await runPromise;
+
+  assert.equal(await readFile(path.join(dataPath, "result.md"), "utf8"), "tool error was handled");
 });
 
 test("worker watches storage and starts when task.md appears", async (t) => {
@@ -621,6 +1262,87 @@ test("worker host can use configured search module from generated app code", asy
   assert.match(await readFile(path.join(dataPath, "result.json"), "utf8"), /"summary": "searched"/);
 });
 
+test("worker host degrades search module errors into empty search results", async (t) => {
+  const dataPath = await createDataDir();
+  const runtime = new RuntimeStub("worker:1");
+  const service = new TaskWorkerService(runtime, {
+    dataPath,
+    aiKind: "ai",
+    aiTarget: "ai:1",
+    searchTarget: "search:1",
+  });
+  enableAutoTodoPlanner(service, runtime);
+
+  await writeFile(path.join(dataPath, "task.md"), "search for people", "utf8");
+
+  t.after(async () => {
+    await rm(dataPath, { recursive: true, force: true });
+  });
+
+  const runPromise = service.onMessage({
+    s: "agent:1",
+    t: "worker:1",
+    c: "tool",
+    i: "req-search-error-1",
+  });
+
+  await waitFor(() => runtime.sent.some((message) => message.t === "ai:1" && message.c === "tool"));
+  const generationRequest = runtime.sent.find((message) => message.t === "ai:1" && message.c === "tool");
+  assert.ok(generationRequest);
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: generationRequest!.i,
+    m: {
+      files: createAiFiles(`export default async function run(host) {
+  const response = await host.search({ query: "ida jonas", limit: 5 });
+  await host.writeFile("result.md", response.results.length === 0 ? "empty" : "unexpected");
+  await host.completeTask({ summary: response.results.length === 0 ? "search empty fallback" : "unexpected", resultFile: "result.md" });
+}
+`),
+    },
+  });
+
+  await waitFor(() => runtime.sent.some((message) => message.t === "search:1" && message.c === "tool"));
+  const searchRequest = runtime.sent.find((message) => message.t === "search:1" && message.c === "tool");
+  assert.ok(searchRequest);
+
+  await service.onMessage({
+    s: "search:1",
+    t: "worker:1",
+    c: "error",
+    i: searchRequest!.i,
+    m: {
+      requestId: searchRequest!.i,
+      responder: "search:1",
+      reason: "All search sources failed",
+      code: "search-sources-failed",
+    },
+  });
+
+  await waitFor(() => runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool").length >= 2);
+  const verificationRequest = runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool").at(-1);
+  assert.ok(verificationRequest);
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: verificationRequest!.i,
+    m: { answer: "VALID: search empty fallback" },
+  });
+
+  await runPromise;
+
+  const progressLog = await readFile(path.join(dataPath, "logs", "progress.log"), "utf8");
+  assert.match(progressLog, /search: Search returned no usable results for "ida jonas": All search sources failed/);
+  assert.match(progressLog, /complete: search empty fallback/);
+  assert.equal(await readFile(path.join(dataPath, "result.md"), "utf8"), "empty");
+  assert.match(await readFile(path.join(dataPath, "result.json"), "utf8"), /"summary": "search empty fallback"/);
+});
+
 test("worker retries after app execution errors and keeps going until repair succeeds", async (t) => {
   const dataPath = await createDataDir();
   const runtime = new RuntimeStub("worker:1");
@@ -936,7 +1658,7 @@ test("worker synthesizes memory.md after a failed attempt and reuses it on repai
   await waitFor(() => runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool").length >= 3, 4_000);
   const repairRequest = runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool")[2];
   assert.ok(repairRequest);
-  assert.match(JSON.stringify(repairRequest.m), /previous run threw boom/i);
+  assert.match(JSON.stringify(repairRequest.m), /memory\.md/i);
 
   await service.onMessage({
     s: "ai:1",
@@ -1114,7 +1836,7 @@ test("worker rejects generated app source that calls host.askAi and repairs it",
   assert.match(await readFile(path.join(dataPath, "logs", "progress.log"), "utf8"), /Generated app must not call host\.askAi/);
 });
 
-test("worker archives tasks and includes existing app source in the first iteration request", async (t) => {
+test("worker archives tasks and exposes the existing app via tools in the first iteration request", async (t) => {
   const dataPath = await createDataDir();
   const runtime = new RuntimeStub("worker:1");
   const service = new TaskWorkerService(runtime, { dataPath, aiKind: "ai", aiTarget: "ai:1" });
@@ -1136,11 +1858,12 @@ test("worker archives tasks and includes existing app source in the first iterat
     i: "req-archive-1",
   });
 
-  await waitFor(() => runtime.sent.some((message) => message.t === "ai:1" && message.c === "tool"));
-  const aiRequest = runtime.sent.find((message) => message.t === "ai:1" && message.c === "tool");
+  await waitFor(() => runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool").length >= 1);
+  const aiRequest = runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool")[0];
   assert.ok(aiRequest);
-  assert.match(JSON.stringify(aiRequest!.m), /existingAppSource/);
-  assert.match(JSON.stringify(aiRequest!.m), /export default async function run\(\) \{\}/);
+  assert.match(JSON.stringify(aiRequest!.m), /"type":"tool_use"/);
+  assert.match(JSON.stringify(aiRequest!.m), /app\/index\.ts/);
+  assert.match(JSON.stringify(aiRequest!.m), /read_file/);
 
   await service.onMessage({
     s: "ai:1",
@@ -1196,6 +1919,7 @@ test("worker can iterate with continue before testing and grows working context"
   await waitFor(() => runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool").length >= 1);
   const firstRequest = runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool")[0];
   assert.ok(firstRequest);
+  assert.match(JSON.stringify(firstRequest.m), /\\"intent\\":\s*\\"short reason for this implementation step and what it is meant to achieve\\"/);
 
   await service.onMessage({
     s: "ai:1",
@@ -1204,6 +1928,7 @@ test("worker can iterate with continue before testing and grows working context"
     i: firstRequest.i,
     m: {
       decision: "continue",
+      intent: "Create the first runnable API skeleton so later iterations can wire the route behavior.",
       summary: "scaffolded api server",
       notes: "keep iterating",
       files: createAiFiles(
@@ -1219,6 +1944,7 @@ test("worker can iterate with continue before testing and grows working context"
   await waitFor(() => runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool").length >= 2);
   const secondRequest = runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool")[1];
   assert.ok(secondRequest);
+  assert.match(JSON.stringify(secondRequest.m), /Create the first runnable API skeleton so later iterations can wire the route behavior\./);
   assert.match(JSON.stringify(secondRequest.m), /scaffolded api server/);
   assert.match(JSON.stringify(secondRequest.m), /continue/);
 
@@ -1229,6 +1955,7 @@ test("worker can iterate with continue before testing and grows working context"
     i: secondRequest.i,
     m: {
       decision: "test",
+      intent: "Finish the remaining route work so the worker can stop iterating and run verification.",
       summary: "ready to test",
       files: createAiFiles(
         `export default async function run(host) {
@@ -1255,21 +1982,24 @@ test("worker can iterate with continue before testing and grows working context"
   await runPromise;
 
   assert.equal(
-    await readFile(path.join(dataPath, "todo.md"), "utf8"),
-    "# TODO\n- [x] Review existing app\n- [x] Implement API routes\n",
+    await readFile(path.join(dataPath, "tasks.json"), "utf8"),
+    createTasksJson([
+      { id: "task-1", title: "Review existing app", status: "done" },
+      { id: "task-2", title: "Implement API routes", status: "done" },
+    ]),
   );
   const contextLog = await readFile(path.join(dataPath, "logs", "context.log"), "utf8");
   assert.equal(contextLog, "");
-  assert.match(await readFile(path.join(dataPath, "logs", "progress.log"), "utf8"), /Cleared implementation working context before test/);
+  assert.match(await readFile(path.join(dataPath, "logs", "progress.log"), "utf8"), /Cleared implementation working context after completed run/);
 });
 
-test("worker rejects invalid todo.md responses and retries with repair", async (t) => {
+test("worker rejects invalid task list responses and retries with repair", async (t) => {
   const dataPath = await createDataDir();
   const runtime = new RuntimeStub("worker:1");
   const service = new TaskWorkerService(runtime, { dataPath, aiKind: "ai", aiTarget: "ai:1" });
   enableAutoTodoPlanner(service, runtime);
 
-  await writeFile(path.join(dataPath, "task.md"), "todo must be valid", "utf8");
+  await writeFile(path.join(dataPath, "task.md"), "task list must be valid", "utf8");
 
   t.after(async () => {
     await rm(dataPath, { recursive: true, force: true });
@@ -1293,10 +2023,10 @@ test("worker rejects invalid todo.md responses and retries with repair", async (
     i: firstRequest.i,
     m: {
       decision: "test",
-      summary: "invalid todo",
+      summary: "invalid tasks",
       files: createAiFiles(
         `export default async function run(host) {
-  await host.completeTask("bad todo");
+  await host.completeTask("bad tasks");
 }
 `,
         "# TODO\nDo the thing\n",
@@ -1312,7 +2042,7 @@ test("worker rejects invalid todo.md responses and retries with repair", async (
     t: "worker:1",
     c: "result",
     i: memoryRequest.i,
-    m: { answer: "Remember: todo.md must contain checkbox items." },
+    m: { answer: "Remember: tasks.json must contain valid tasks." },
   });
 
   await waitFor(() => runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool").length >= 3, 4_000);
@@ -1326,10 +2056,10 @@ test("worker rejects invalid todo.md responses and retries with repair", async (
     i: repairRequest.i,
     m: {
       decision: "test",
-      summary: "todo repaired",
+      summary: "task list repaired",
       files: createAiFiles(
         `export default async function run(host) {
-  await host.completeTask("todo repaired");
+  await host.completeTask("task list repaired");
 }
 `,
         "# TODO\n- [x] Repair todo format\n",
@@ -1345,22 +2075,25 @@ test("worker rejects invalid todo.md responses and retries with repair", async (
     t: "worker:1",
     c: "result",
     i: verificationRequest.i,
-    m: { answer: "VALID: todo repaired" },
+    m: { answer: "VALID: task list repaired" },
   });
 
   await runPromise;
 
-  assert.match(await readFile(path.join(dataPath, "logs", "progress.log"), "utf8"), /Generated todo\.md contains invalid checklist formatting/);
-  assert.equal(await readFile(path.join(dataPath, "todo.md"), "utf8"), "# TODO\n- [x] Repair todo format\n");
+  assert.match(await readFile(path.join(dataPath, "logs", "progress.log"), "utf8"), /Generated task list is required|Unexpected token|tasks\.json/);
+  assert.equal(
+    await readFile(path.join(dataPath, "tasks.json"), "utf8"),
+    createTasksJson([{ id: "task-1", title: "Repair todo format", status: "done" }]),
+  );
 });
 
-test("worker prefers TypeScript fenced app source when answer also includes todo content", async (t) => {
+test("worker prefers TypeScript fenced app source when answer also includes task list content", async (t) => {
   const dataPath = await createDataDir();
   const runtime = new RuntimeStub("worker:1");
   const service = new TaskWorkerService(runtime, { dataPath, aiKind: "ai", aiTarget: "ai:1" });
   enableAutoTodoPlanner(service, runtime);
 
-  await writeFile(path.join(dataPath, "task.md"), "return the actual app source even if todo is restated", "utf8");
+  await writeFile(path.join(dataPath, "task.md"), "return the actual app source even if task list is restated", "utf8");
 
   t.after(async () => {
     await rm(dataPath, { recursive: true, force: true });
@@ -1380,6 +2113,15 @@ test("worker prefers TypeScript fenced app source when answer also includes todo
     c: "result",
     i: firstRequest.i,
     m: {
+      files: [
+        {
+          path: "tasks.json",
+          content: createTasksJson([
+            { id: "task-1", title: "Review existing app", status: "done" },
+            { id: "task-2", title: "Implement API routes", status: "done" },
+          ]),
+        },
+      ],
       answer: [
         "decision: test",
         "summary: implemented http api",
@@ -1416,18 +2158,21 @@ test("worker prefers TypeScript fenced app source when answer also includes todo
   assert.match(appSource, /export default async function run\(host\)/);
   assert.doesNotMatch(appSource, /^# TODO/m);
   assert.equal(
-    await readFile(path.join(dataPath, "todo.md"), "utf8"),
-    "# TODO\n- [x] Review existing app\n- [x] Implement API routes",
+    await readFile(path.join(dataPath, "tasks.json"), "utf8"),
+    createTasksJson([
+      { id: "task-1", title: "Review existing app", status: "done" },
+      { id: "task-2", title: "Implement API routes", status: "done" },
+    ]),
   );
 });
 
-test("worker blocks test runs while todo.md still has open items", async (t) => {
+test("worker blocks test runs while tasks.json still has open items", async (t) => {
   const dataPath = await createDataDir();
   const runtime = new RuntimeStub("worker:1");
   const service = new TaskWorkerService(runtime, { dataPath, aiKind: "ai", aiTarget: "ai:1" });
   enableAutoTodoPlanner(service, runtime);
 
-  await writeFile(path.join(dataPath, "task.md"), "finish todo before test", "utf8");
+  await writeFile(path.join(dataPath, "task.md"), "finish tasks before test", "utf8");
 
   t.after(async () => {
     await rm(dataPath, { recursive: true, force: true });
@@ -1437,7 +2182,7 @@ test("worker blocks test runs while todo.md still has open items", async (t) => 
     s: "agent:1",
     t: "worker:1",
     c: "tool",
-    i: "req-open-todo-1",
+    i: "req-open-task-1",
   });
 
   await waitFor(() => runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool").length >= 1);
@@ -1500,11 +2245,11 @@ test("worker blocks test runs while todo.md still has open items", async (t) => 
 
   assert.match(
     await readFile(path.join(dataPath, "logs", "progress.log"), "utf8"),
-    /Generated todo\.md still has open items, so the worker will keep iterating instead of starting test/,
+    /Generated task list still has open items, so the worker will keep iterating instead of starting test/,
   );
   assert.doesNotMatch(
     await readFile(path.join(dataPath, "logs", "progress.log"), "utf8"),
-    /Attempt 1 failed: Generated todo\.md still has open items/,
+    /Attempt 1 failed: Generated task list still has open items/,
   );
 });
 
@@ -1565,7 +2310,7 @@ test("worker rejects continue iterations that make no implementation progress", 
     t: "worker:1",
     c: "result",
     i: memoryRequest.i,
-    m: { answer: "Remember: each continue iteration must change code or todo.md." },
+    m: { answer: "Remember: each continue iteration must change code or tasks.json." },
   });
 
   const repairRequest = await waitForAiTool(runtime, 4);
@@ -1601,11 +2346,11 @@ test("worker rejects continue iterations that make no implementation progress", 
 
   assert.match(
     await readFile(path.join(dataPath, "logs", "progress.log"), "utf8"),
-    /Attempt 1 failed: Iteration made no implementation progress: app\/index\.ts and todo\.md were unchanged/,
+    /Attempt 1 failed: Iteration made no implementation progress: app\/index\.ts and tasks\.json were unchanged/,
   );
 });
 
-test("worker allows todo-only progress when analysis tasks are completed", async (t) => {
+test("worker allows task-only progress when analysis tasks are completed", async (t) => {
   const dataPath = await createDataDir();
   const runtime = new RuntimeStub("worker:1");
   const service = new TaskWorkerService(runtime, { dataPath, aiKind: "ai", aiTarget: "ai:1" });
@@ -1638,7 +2383,7 @@ test("worker allows todo-only progress when analysis tasks are completed", async
     m: {
       decision: "continue",
       summary: "reviewed the existing files and clarified the next implementation tasks",
-      notes: "Inspected the current app entrypoint and task inputs. Both review todos are done.",
+      notes: "Inspected the current app entrypoint and task inputs. Both review tasks are done.",
       files: createAiFiles(
         unchangedApp,
         "# TODO\n- [x] Inspect existing app/index.ts\n- [x] Review task and memory inputs\n- [ ] Implement HTTP API\n",
@@ -1680,8 +2425,12 @@ test("worker allows todo-only progress when analysis tasks are completed", async
   const progressLog = await readFile(path.join(dataPath, "logs", "progress.log"), "utf8");
   assert.doesNotMatch(progressLog, /Iteration made no implementation progress/);
   assert.equal(
-    await readFile(path.join(dataPath, "todo.md"), "utf8"),
-    "# TODO\n- [x] Inspect existing app/index.ts\n- [x] Review task and memory inputs\n- [x] Implement HTTP API\n",
+    await readFile(path.join(dataPath, "tasks.json"), "utf8"),
+    createTasksJson([
+      { id: "task-1", title: "Inspect existing app/index.ts", status: "done" },
+      { id: "task-2", title: "Review task and memory inputs", status: "done" },
+      { id: "task-3", title: "Implement HTTP API", status: "done" },
+    ]),
   );
 });
 
@@ -1691,7 +2440,7 @@ test("worker rejects deferred test iterations that do not advance checklist comp
   const service = new TaskWorkerService(runtime, { dataPath, aiKind: "ai", aiTarget: "ai:1" });
   enableAutoTodoPlanner(service, runtime);
 
-  await writeFile(path.join(dataPath, "task.md"), "must not loop on the same remaining todo", "utf8");
+  await writeFile(path.join(dataPath, "task.md"), "must not loop on the same remaining task", "utf8");
 
   t.after(async () => {
     await rm(dataPath, { recursive: true, force: true });
@@ -1748,7 +2497,7 @@ test("worker rejects deferred test iterations that do not advance checklist comp
     t: "worker:1",
     c: "result",
     i: memoryRequest.i,
-    m: { answer: "Remember: if testing is deferred, the next iteration must complete additional checklist items before trying again." },
+    m: { answer: "Remember: if testing is deferred, the next iteration must complete additional tasks before trying again." },
   });
 
   const repairRequest = await waitForAiTool(runtime, 4);
@@ -1784,7 +2533,7 @@ test("worker rejects deferred test iterations that do not advance checklist comp
 
   assert.match(
     await readFile(path.join(dataPath, "logs", "progress.log"), "utf8"),
-    /Attempt 1 failed: Iteration made no implementation progress: app\/index\.ts and todo\.md were unchanged/,
+    /Attempt 1 failed: Iteration made no implementation progress: app\/index\.ts and tasks\.json were unchanged/,
   );
 });
 
@@ -1818,6 +2567,7 @@ test("worker emits clear step-by-step progress messages", async (t) => {
     i: firstRequest.i,
     m: {
       decision: "continue",
+      intent: "Clarify the response shape before writing the result file.",
       summary: "planning api shape",
       files: createAiFiles(
         `export default async function run(host) {
@@ -1840,6 +2590,7 @@ test("worker emits clear step-by-step progress messages", async (t) => {
     i: secondRequest.i,
     m: {
       decision: "test",
+      intent: "Write the final result path so the smoke test can run against a finished implementation.",
       summary: "ready for smoke test",
       files: createAiFiles(
         `export default async function run(host) {
@@ -1871,11 +2622,11 @@ test("worker emits clear step-by-step progress messages", async (t) => {
 
   assert.ok(progressMessages.some((message) => message.includes("planning next implementation step 1")));
   assert.ok(progressMessages.some((message) => message.includes("planning final implementation step 2")));
-  assert.ok(progressMessages.some((message) => message.includes("implementation checklist is complete. start fresh test run.")));
+  assert.ok(progressMessages.some((message) => message.includes("all tracked implementation tasks are complete. start fresh test run.")));
   assert.ok(progressMessages.some((message) => message.includes("test passed. finished")));
 });
 
-test("worker clears working context after each test and keeps memory", async (t) => {
+test("worker clears working context after memorizing failure and keeps memory", async (t) => {
   const dataPath = await createDataDir();
   const runtime = new RuntimeStub("worker:1");
   const service = new TaskWorkerService(runtime, { dataPath, aiKind: "ai", aiTarget: "ai:1" });
@@ -1954,7 +2705,7 @@ test("worker clears working context after each test and keeps memory", async (t)
   const repairRequest = runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool")[3];
   assert.ok(repairRequest);
   assert.doesNotMatch(JSON.stringify(repairRequest.m), /collecting context/);
-  assert.match(JSON.stringify(repairRequest.m), /Remember the failed test result\./);
+  assert.match(JSON.stringify(repairRequest.m), /memory\.md/);
   assert.doesNotMatch(JSON.stringify(repairRequest.m), /Fix failing test path/);
 
   await service.onMessage({
@@ -1991,6 +2742,99 @@ test("worker clears working context after each test and keeps memory", async (t)
 
   assert.equal(await readFile(path.join(dataPath, "logs", "context.log"), "utf8"), "");
   assert.equal(await readFile(path.join(dataPath, "memory.md"), "utf8"), "Remember the failed test result.");
+  assert.match(await readFile(path.join(dataPath, "logs", "progress.log"), "utf8"), /Cleared implementation working context after memorizing failed attempt/);
+  assert.match(await readFile(path.join(dataPath, "logs", "progress.log"), "utf8"), /Cleared implementation working context after completed run/);
+});
+
+test("worker console logs exclude task and tool content", async (t) => {
+  const dataPath = await createDataDir();
+  const runtime = new RuntimeStub("worker:1");
+  const service = new TaskWorkerService(runtime, { dataPath, aiKind: "ai", aiTarget: "ai:1" });
+
+  await writeFile(path.join(dataPath, "task.md"), "secret task body should stay out of stdout", "utf8");
+
+  const originalConsoleLog = console.log;
+  const lines: string[] = [];
+  console.log = (...args: unknown[]) => {
+    lines.push(args.map((arg) => String(arg)).join(" "));
+  };
+
+  t.after(async () => {
+    console.log = originalConsoleLog;
+    await rm(dataPath, { recursive: true, force: true });
+  });
+
+  const runPromise = service.onMessage({
+    s: "agent:1",
+    t: "worker:1",
+    c: "tool",
+    i: "req-console-redaction",
+  });
+
+  const aiRequest = await waitForAiTool(runtime, 1);
+  assert.ok(aiRequest);
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: aiRequest.i,
+    m: {
+      toolCalls: [
+        {
+          id: "tool-1",
+          type: "function",
+          name: "write_file",
+          arguments: JSON.stringify({
+            path: "app/index.ts",
+            content: `export default async function run(host) {
+  await host.completeTask({ summary: "very secret summary", resultFile: "result.md" });
+}
+`,
+          }),
+        },
+      ],
+    },
+  });
+
+  const followUpRequest = await waitForAiTool(runtime, 2);
+  assert.ok(followUpRequest);
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: followUpRequest.i,
+    m: {
+      decision: "test",
+      intent: "Finalize the repaired app so verification can run without exposing task content.",
+      summary: "very secret summary",
+      files: createAiFiles(`export default async function run(host) {
+  await host.completeTask({ summary: "very secret summary", resultFile: "result.md" });
+}
+`, "# TODO\n- [x] Review existing app\n"),
+    },
+  });
+
+  const verificationRequest = await waitForAiTool(runtime, 3);
+  assert.ok(verificationRequest);
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: verificationRequest.i,
+    m: { answer: "VALID: repaired" },
+  });
+
+  await runPromise;
+
+  const output = lines.join("\n");
+  assert.doesNotMatch(output, /secret task body should stay out of stdout/);
+  assert.doesNotMatch(output, /very secret summary/);
+  assert.match(output, /\[worker:worker:1\] intent iteration=1 decision=test reason=Finalize the repaired app so verification can run without exposing task content\./);
+  assert.match(output, /\[worker:worker:1\] progress phase=/);
+  assert.match(output, /\[worker:worker:1\] tool: source=iteration name=write_file/);
 });
 
 async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {

@@ -11,6 +11,15 @@ services:
       PROVIDER: "openai"
       OPEN_AI_KEY: ""
       OPEN_AI_MODEL: "gpt-5.4-mini"
+      # AzureAI:
+      # PROVIDER: "azureai"
+      # AZURE_AI_API_KEY: ""
+      # AZURE_AI_MODEL: "gpt-4.1-mini"
+      # AZURE_AI_BASE_URL: "https://<resource>.openai.azure.com/openai/v1"
+      # OpenRouter:
+      # PROVIDER: "openrouter"
+      # OPENROUTER_API_KEY: ""
+      # OPENROUTER_MODEL: "openai/gpt-4.1-mini"
   - name: "worker:1"
     kind: "worker"
     module: "task-worker"
@@ -18,6 +27,9 @@ services:
       networking: false
     environment:
       WORKER_AI_KIND: "ai"
+      # Optional tool toggles:
+      # WORKER_TOOL_WEB_SEARCH_ENABLED: "false"
+      # WORKER_TOOL_EXECUTE_TYPESCRIPT_ENABLED: "false"
   - name: "search:1"
     kind: "search"
     module: "web-search"

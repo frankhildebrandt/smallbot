@@ -3,6 +3,7 @@ import readline from "node:readline";
 import { loadConfig } from "./config.js";
 import { MessageBroker } from "./broker/MessageBroker.js";
 import { SubprocessManager } from "./process/SubprocessManager.js";
+import { QuitDetector } from "./quitDetector.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -21,7 +22,7 @@ async function main(): Promise<void> {
 
   console.log(`[smallbot] broker listening on ${config.brokerSocketPath}`);
   console.log(`[smallbot] registered modules: ${config.modules.map((moduleConfig) => moduleConfig.name).join(", ") || "none"}`);
-  console.log("[smallbot] host tui ready, enter /quit to stop all modules and exit");
+  console.log("[smallbot] host tui ready, enter /quit or press ESC twice to stop all modules and exit");
 
   const tui = readline.createInterface({
     input: process.stdin,
@@ -30,6 +31,7 @@ async function main(): Promise<void> {
   });
 
   let shuttingDown = false;
+  const quitDetector = new QuitDetector();
 
   const shutdown = async (): Promise<void> => {
     if (shuttingDown) {
@@ -56,6 +58,15 @@ async function main(): Promise<void> {
       console.log(`[smallbot] unknown command: ${command}`);
     }
   });
+
+  readline.emitKeypressEvents(process.stdin, tui);
+  if (process.stdin.isTTY) {
+    process.stdin.on("keypress", (_str, key) => {
+      if (key.sequence && quitDetector.registerKeypress(key.sequence)) {
+        void shutdown();
+      }
+    });
+  }
 
   tui.on("close", () => {
     if (!shuttingDown) {
