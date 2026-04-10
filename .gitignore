@@ -5,3 +5,4 @@ module/*/dist
 module/*/node_modules
 packages/*/dist
 packages/*/node_modules
+settings.yaml
