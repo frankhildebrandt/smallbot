@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "postinstall": "npm install --prefix packages/framework && npm run build --prefix packages/framework && npm install --prefix module/ai-free",
-    "build": "tsc -p tsconfig.json && npm run build --prefix packages/framework && npm install --prefix module/ai-free --silent && npm run build --prefix module/ai-free",
+    "postinstall": "npm install --prefix packages/framework && npm run build --prefix packages/framework && npm install --prefix module/ai-free && npm install --prefix module/web-search && npm install --prefix module/task-worker",
+    "build": "tsc -p tsconfig.json && npm run build --prefix packages/framework && npm install --prefix module/ai-free --silent && npm run build --prefix module/ai-free && npm install --prefix module/web-search --silent && npm run build --prefix module/web-search && npm install --prefix module/task-worker --silent && npm run build --prefix module/task-worker",
     "start": "npm run build --silent && node dist/index.js",
-    "test": "npm run build --silent && node --test dist/test/**/*.test.js"
+    "test": "npm run build --silent && node --test dist/test/**/*.test.js && npm run test --prefix module/ai-free && npm run test --prefix module/web-search && npm run test --prefix module/task-worker"
   },
   "devDependencies": {
     "@types/node": "^22.15.3",

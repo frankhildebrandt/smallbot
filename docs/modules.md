@@ -45,6 +45,7 @@ Damit koennen Module:
 3. Nachrichten empfangen,
 4. Antworten an andere Services senden.
 
-## Beispielmodul `ai-free`
+## Beispielmodule
 
-Das Beispielmodul registriert sich als `ai`-Service und beantwortet `tool`-Nachrichten mit einer einfachen JSON-Antwort. Es dient als Vorlage fuer weitere Module wie RAG, Normalisierung oder Orchestrierung.
+- `ai-free` registriert sich als `ai`-Service und beantwortet `tool`-Nachrichten mit AI-Inference-Antworten. Es dient als Vorlage fuer Provider-basierte Modulintegration.
+- `web-search` registriert sich als `search`-Service und beantwortet `tool`-Nachrichten mit freien Multi-Source-Websuchergebnissen. Das Modul normalisiert Treffer, fuehrt mehrere HTTP-Quellen zusammen und entfernt Dubletten ueber normalisierte Ziel-URLs.
