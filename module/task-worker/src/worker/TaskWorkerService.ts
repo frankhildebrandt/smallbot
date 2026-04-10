@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { watch, type FSWatcher } from "node:fs";
 import { access, appendFile, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -10,243 +11,79 @@ import { WireMessage, createMessage } from "@smallbot/framework";
 import ts from "typescript";
 
 import {
+  extractAssistantResponseMessage,
+  extractIterationDecision,
+  extractIterationIntent,
+  extractIterationNotes,
+  extractIterationSummary,
+  extractMemoryContent,
+  extractToolCalls,
+  extractVerificationOutcome,
+  selectAppSource,
+  selectTaskListContent,
+} from "../ai/aiPayloadExtraction.js";
+import {
+  isMissingFileError,
+  normalizePositiveInteger,
+  requireStringArg,
+  summarizeLine,
+} from "../ai/aiToolArgs.js";
+import {
   CompletionPayload,
   PendingRequest,
   ProgressEvent,
-  ProgressUpdatePayload,
   WorkerContextConfig,
   WorkerRunResult,
   WorkerRuntime,
   WorkerSearchRequest,
   WorkerSearchResponse,
-} from "./contracts.js";
-import type { WorkerAiToolName } from "./contracts.js";
-import { createDefaultAppTemplate } from "./defaultAppTemplate.js";
+} from "../contracts.js";
+import type { WorkerAiToolName } from "../contracts.js";
+import { delay } from "../util/delay.js";
+import {
+  buildServiceUrl,
+  extractTaskHttpChecks,
+  normalizeComparableText,
+  normalizeCompletionPayload,
+  normalizeFailurePayload,
+  normalizeProgressUpdate,
+  normalizeServicePath,
+  normalizeServiceReadyPayload,
+} from "../host/hostPayloadNormalizers.js";
+import { IMPLEMENTATION_TOOLS } from "../ai/implementationTools.js";
+import {
+  formatPlanningMessage,
+  getTaskStats,
+  normalizeForProgressComparison,
+  normalizeTaskListForProgressComparison,
+  taskListHasOpenItems,
+} from "../task/iterationProgress.js";
+import {
+  createEmptySearchResponse,
+  extractDiscoveryServices,
+  normalizeSearchFailure,
+  normalizeSearchRequest,
+  normalizeSearchResponse,
+} from "../search/searchHelpers.js";
+import { parseTaskList, requireTaskStatusArg } from "../task/taskJson.js";
+import type {
+  ActiveServiceHandle,
+  AiFunctionToolDefinition,
+  AiInferenceToolUseRequest,
+  AiToolCallMessage,
+  AiToolResponseMessage,
+  FailedAttemptSnapshot,
+  IterationContextEntry,
+  IterationInstruction,
+  PromptContext,
+  RuntimeModePhase,
+  WorkerHost,
+  WorkerHttpServiceOptions,
+  WorkerRunResultService,
+  WorkerTask,
+} from "../types/taskWorkerTypes.js";
 
 const exec = promisify(execCallback);
-
-interface WorkerHost {
-  readFile(filePath: string): Promise<string>;
-  writeFile(filePath: string, content: string): Promise<void>;
-  appendProgress(event: string | ProgressUpdatePayload): Promise<void>;
-  readTask(): Promise<string>;
-  readMemory(): Promise<string>;
-  writeMemory(content: string): Promise<void>;
-  search(request: string | WorkerSearchRequest): Promise<WorkerSearchResponse>;
-  completeTask(payload: string | { summary: string; resultFile?: string }): Promise<void>;
-  failTask(payload: string | { summary: string }): Promise<void>;
-}
-
-type WorkerTaskStatus = "open" | "done";
-
-interface WorkerTask {
-  id: string;
-  title: string;
-  status: WorkerTaskStatus;
-}
-
-interface IterationContextEntry {
-  iteration: number;
-  decision: "continue" | "test";
-  summary: string;
-  notes?: string;
-  tasks: WorkerTask[];
-  appSource: string;
-  updatedFiles: string[];
-}
-
-interface IterationInstruction {
-  decision: "continue" | "test";
-  summary: string;
-  notes?: string;
-  appSource: string;
-  wasTestDeferred?: boolean;
-}
-
-interface PromptContext {
-  task: string;
-  memory: string;
-  existingAppSource: string;
-  tasks: WorkerTask[];
-  workingContext: IterationContextEntry[];
-  progressLog: string;
-  contextLog: string;
-}
-
-type RuntimeModePhase =
-  | "start"
-  | "implementation:planning"
-  | "implementation:iterating"
-  | "test"
-  | "experience"
-  | "idle";
-
-interface FailedAttemptSnapshot {
-  attempt: number;
-  iteration: number;
-  error: string;
-  workingContext: IterationContextEntry[];
-  appSource: string;
-  tasks: WorkerTask[];
-}
-
-interface AiFunctionToolDefinition {
-  type: "function";
-  name: string;
-  description: string;
-  parameters: Record<string, unknown>;
-}
-
-interface AiToolCallMessage {
-  id: string;
-  type: "function";
-  name: string;
-  arguments: string;
-}
-
-interface AiAssistantResponseMessage {
-  role: "assistant";
-  content?: string;
-  refusal?: string;
-  toolCalls?: AiToolCallMessage[];
-}
-
-interface AiToolResponseMessage {
-  role: "tool";
-  content: string;
-  toolCallId: string;
-}
-
-interface AiInferenceToolUseRequest {
-  type: "tool_use";
-  system?: string;
-  messages: Array<
-    | { role: "user"; content: string }
-    | AiAssistantResponseMessage
-    | AiToolResponseMessage
-  >;
-  tools: AiFunctionToolDefinition[];
-  toolChoice?: "auto" | "required" | "none";
-}
-
-const IMPLEMENTATION_TOOLS: Array<AiFunctionToolDefinition & { name: WorkerAiToolName }> = [
-  {
-    type: "function",
-    name: "list_files",
-    description: "List files under the worker storage root.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "Optional relative directory inside storage." },
-        limit: { type: "number", description: "Maximum number of paths to return." },
-      },
-    },
-  },
-  {
-    type: "function",
-    name: "read_file",
-    description: "Read a UTF-8 text file from worker storage.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "Relative file path inside storage." },
-      },
-      required: ["path"],
-    },
-  },
-  {
-    type: "function",
-    name: "write_file",
-    description: "Write a UTF-8 text file inside worker storage.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "Relative file path inside storage." },
-        content: { type: "string", description: "Full replacement file content." },
-      },
-      required: ["path", "content"],
-    },
-  },
-  {
-    type: "function",
-    name: "search_files",
-    description: "Search file paths and text contents inside worker storage.",
-    parameters: {
-      type: "object",
-      properties: {
-        query: { type: "string", description: "Plain-text query to search for." },
-        path: { type: "string", description: "Optional relative directory inside storage." },
-        limit: { type: "number", description: "Maximum number of matches to return." },
-      },
-      required: ["query"],
-    },
-  },
-  {
-    type: "function",
-    name: "create_task",
-    description: "Create a new open implementation task managed by the worker.",
-    parameters: {
-      type: "object",
-      properties: {
-        title: { type: "string", description: "Short task title." },
-      },
-      required: ["title"],
-    },
-  },
-  {
-    type: "function",
-    name: "update_task",
-    description: "Update an existing worker-managed implementation task.",
-    parameters: {
-      type: "object",
-      properties: {
-        id: { type: "string", description: "Existing task id." },
-        status: { type: "string", description: "Task status: open or done." },
-        title: { type: "string", description: "Optional replacement task title." },
-      },
-      required: ["id", "status"],
-    },
-  },
-  {
-    type: "function",
-    name: "list_tasks",
-    description: "List the current worker-managed implementation tasks.",
-    parameters: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
-    type: "function",
-    name: "web_search",
-    description: "Search the web through the configured search module.",
-    parameters: {
-      type: "object",
-      properties: {
-        query: { type: "string" },
-        limit: { type: "number" },
-        language: { type: "string" },
-        region: { type: "string" },
-        safeSearch: { type: "string" },
-        site: { type: "string" },
-        freshness: { type: "string" },
-      },
-      required: ["query"],
-    },
-  },
-  {
-    type: "function",
-    name: "execute_typescript",
-    description: "Execute arbitrary TypeScript with full Node.js access. Use this for package installs, shell commands, code generation, or any implementation step best handled by running TypeScript directly.",
-    parameters: {
-      type: "object",
-      properties: {
-        script: { type: "string", description: "TypeScript source code to execute." },
-      },
-      required: ["script"],
-    },
-  },
-];
 
 export class TaskWorkerService {
   static readonly DISCOVERY_ATTEMPTS = 5;
@@ -264,6 +101,7 @@ export class TaskWorkerService {
   #watchDebounce?: NodeJS.Timeout;
   #lastAutoRunTask?: string;
   #resolvedAiTarget?: string;
+  #activeService?: ActiveServiceHandle;
 
   constructor(
     private readonly runtime: WorkerRuntime,
@@ -319,6 +157,7 @@ export class TaskWorkerService {
     this.#currentRequestId = requestId;
     this.#completion = null;
     this.#resolvedAiTarget = undefined;
+    await this.stopActiveService();
 
     try {
       await this.runtime.updateState("busy");
@@ -379,6 +218,7 @@ export class TaskWorkerService {
         );
       }
     } finally {
+      await this.stopActiveService();
       await this.runtime.updateState("free");
       this.#currentCaller = undefined;
       this.#currentRequestId = undefined;
@@ -968,8 +808,10 @@ export class TaskWorkerService {
         ...(hasWebSearchTool
           ? ["Use the web_search tool when external lookup is required. Generated app code must use host.search(...) for runtime web lookups."]
           : []),
+        "Use host.serveHttp(...) to expose the local HTTP REST API.",
+        "When implementing a long-running service, call host.markReady({ summary, host, port, path? }) after the listener is active instead of completeTask(...).",
         "Do not call AI, do not request more inference, and do not use host.askAi.",
-        "Do not perform direct network requests; use only host methods.",
+        "Do not perform outbound network requests; use only host methods.",
         "Use only the host methods described in the request.",
       ].join(" "),
       toolChoice: "auto",
@@ -989,6 +831,7 @@ export class TaskWorkerService {
             availableFiles,
             requiredResponse: {
               decision: "continue | test",
+              intent: "short reason for this implementation step and what it is meant to achieve",
               summary: "short summary of the change for the worker context",
               notes: "optional additional notes",
               taskRule: "Implementation work must be tracked exclusively through create_task, update_task, and list_tasks; choose test only when all tasks are done",
@@ -1004,6 +847,8 @@ export class TaskWorkerService {
                 "readMemory",
                 "writeMemory",
                 "search",
+                "serveHttp",
+                "markReady",
                 "completeTask",
                 "failTask",
               ],
@@ -1035,11 +880,13 @@ export class TaskWorkerService {
       timestamp,
       iteration: entry.iteration,
       decision: entry.decision,
+      intent: entry.intent,
       summary: entry.summary,
       notes: entry.notes,
       tasks: entry.tasks,
       updatedFiles: entry.updatedFiles,
     });
+    console.log(`[worker:${this.runtime.serviceName}] intent iteration=${entry.iteration} decision=${entry.decision} reason=${entry.intent}`);
     await appendFile(this.resolveStoragePath("logs/context.log"), `${record}\n`, "utf8");
   }
 
@@ -1095,7 +942,6 @@ export class TaskWorkerService {
   private async runImplementationMode(task: string, requestId: string): Promise<WorkerRunResult> {
     let attempt = 0;
     let iteration = 0;
-    let lastErrorMessage: string | undefined;
     const workingContext: IterationContextEntry[] = [];
 
     await writeFile(this.resolveStoragePath("logs/context.log"), "", "utf8");
@@ -1110,7 +956,6 @@ export class TaskWorkerService {
         attempt,
         iteration,
         workingContext,
-        lastErrorMessage,
       );
       if (!failure) {
         await this.clearWorkingContext("Cleared implementation working context after completed run");
@@ -1119,7 +964,6 @@ export class TaskWorkerService {
       }
 
       iteration = failure.iteration;
-      lastErrorMessage = failure.error;
       await this.runExperienceMode(task, requestId, failure);
       await delay(TaskWorkerService.RUN_RETRY_DELAY_MS);
     }
@@ -1131,7 +975,6 @@ export class TaskWorkerService {
     attempt: number,
     startingIteration: number,
     workingContext: IterationContextEntry[],
-    lastErrorMessage?: string,
   ): Promise<FailedAttemptSnapshot | null> {
     let iteration = startingIteration;
 
@@ -1179,6 +1022,7 @@ export class TaskWorkerService {
         const entry: IterationContextEntry = {
           iteration,
           decision: normalizedInstruction.decision,
+          intent: normalizedInstruction.intent,
           summary: normalizedInstruction.summary,
           notes: normalizedInstruction.notes,
           tasks: latestTasks,
@@ -1212,8 +1056,10 @@ export class TaskWorkerService {
       }
 
       this.#completion = await this.verifyCompletion(task, completion, workingContext);
+      await this.stopActiveService();
       return null;
     } catch (error) {
+      await this.stopActiveService();
       const message = error instanceof Error ? error.message : "Worker execution failed";
       const promptContext = await this.buildPromptContext(task, workingContext);
 
@@ -1281,6 +1127,7 @@ export class TaskWorkerService {
     progressMessage: string,
     updatedFiles: string[],
   ): Promise<void> {
+    await this.stopActiveService();
     const sourcePath = this.resolveStoragePath(relativeAppPath);
     const tsSource = await readFile(sourcePath, "utf8");
     const transpiled = ts.transpileModule(tsSource, {
@@ -1347,6 +1194,39 @@ export class TaskWorkerService {
         const response = await this.search(request);
         return response;
       },
+      serveHttp: async (options) => this.startHttpService(options),
+      markReady: async (payload) => {
+        const readiness = normalizeServiceReadyPayload(payload);
+        const activeService = this.#activeService;
+        const hostValue = readiness.host ?? activeService?.host ?? "127.0.0.1";
+        const pathValue = readiness.path ?? activeService?.path ?? "/";
+        const portValue = readiness.port || activeService?.port;
+
+        if (!portValue) {
+          throw new Error("markReady requires a running service port");
+        }
+
+        this.#completion = {
+          success: true,
+          summary: readiness.summary,
+          service: {
+            host: hostValue,
+            port: portValue,
+            path: pathValue,
+            url: buildServiceUrl(hostValue, portValue, pathValue),
+          },
+        };
+        await this.appendProgressLog("app", readiness.summary);
+        await this.emitProgress({
+          requestId: this.#currentRequestId ?? randomUUID(),
+          worker: this.runtime.serviceName,
+          phase: "app",
+          message: readiness.summary,
+          updatedFiles: [this.relativeStoragePath("logs/progress.log")],
+          done: false,
+          state: "running",
+        });
+      },
       completeTask: async (payload) => {
         const { summary, resultFile } = normalizeCompletionPayload(payload);
         this.#completion = {
@@ -1392,15 +1272,16 @@ export class TaskWorkerService {
   ): Promise<WorkerRunResult> {
     await this.appendProgressLog("test", "Requesting AI result verification");
     const appSource = await this.readExistingAppSource();
+    const observedService = completion.service ? await this.observeService(task, completion.service) : undefined;
     const resultContent = completion.resultFile
       ? await readFile(this.resolveStoragePath(completion.resultFile), "utf8").catch(() => "")
-      : completion.summary;
+      : observedService?.observedBody ?? completion.summary;
 
     const response = await this.askAi(JSON.stringify({
       type: "completion",
       system: [
         "You verify whether a generated task result appears to satisfy the task.",
-        "Use the app source and completion summary when no result file content is available, such as for long-running services that only signal readiness.",
+        "Use the app source and any observed HTTP response when no result file content is available, such as for long-running services.",
         "Return a verdict of VALID or INVALID plus a short reason.",
       ].join(" "),
       messages: [
@@ -1413,6 +1294,7 @@ export class TaskWorkerService {
             summary: completion.summary,
             resultFile: completion.resultFile,
             resultContent,
+            service: observedService,
           }, null, 2),
         },
       ],
@@ -1433,7 +1315,146 @@ export class TaskWorkerService {
     return {
       ...completion,
       verificationSummary: verification.summary,
+      service: observedService ?? completion.service,
     };
+  }
+
+  private async startHttpService(options: WorkerHttpServiceOptions): Promise<{ url: string; close(): Promise<void> }> {
+    const handler = options.fetch ?? options.handler ?? options.requestHandler;
+
+    if (typeof handler !== "function") {
+      throw new Error("serveHttp requires a fetch-style handler");
+    }
+
+    const pathName = normalizeServicePath(options.path);
+    const server = createServer(async (request, response) => {
+      try {
+        const serviceRequest = await this.toRequest(request, options.host, options.port);
+        const serviceResponse = await handler(serviceRequest);
+        await this.writeResponse(response, serviceResponse);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unhandled service error";
+        response.statusCode = 500;
+        response.setHeader("content-type", "text/plain; charset=utf-8");
+        response.end(message);
+      }
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(options.port, options.host, () => {
+        server.off("error", reject);
+        resolve();
+      });
+    });
+
+    this.#activeService = {
+      server,
+      host: options.host,
+      port: options.port,
+      path: pathName,
+      url: buildServiceUrl(options.host, options.port, pathName),
+    };
+
+    return {
+      url: this.#activeService.url,
+      close: async () => {
+        if (this.#activeService?.server === server) {
+          await this.stopActiveService();
+        }
+      },
+    };
+  }
+
+  private async stopActiveService(): Promise<void> {
+    const activeService = this.#activeService;
+    if (!activeService) {
+      return;
+    }
+
+    this.#activeService = undefined;
+    await new Promise<void>((resolve) => {
+      activeService.server.close(() => resolve());
+    });
+  }
+
+  private async observeService(
+    task: string,
+    service: WorkerRunResultService,
+  ): Promise<WorkerRunResultService> {
+    const response = await fetch(service.url, { method: "GET" });
+    const body = await response.text();
+    const checks = await this.runServiceChecks(task, service);
+    return {
+      ...service,
+      observedStatus: response.status,
+      observedBody: body,
+      checks,
+    };
+  }
+
+  private async runServiceChecks(
+    task: string,
+    service: WorkerRunResultService,
+  ): Promise<Array<{
+    requestBody: string;
+    responseStatus: number;
+    responseBody: string;
+    expectedBody?: string;
+    matchesExpected?: boolean;
+  }>> {
+    const cases = extractTaskHttpChecks(task);
+    const checks = [];
+
+    for (const testCase of cases) {
+      const response = await fetch(service.url, {
+        method: "POST",
+        headers: {
+          "content-type": "text/plain; charset=utf-8",
+        },
+        body: testCase.requestBody,
+      });
+      const responseBody = await response.text();
+
+      checks.push({
+        requestBody: testCase.requestBody,
+        responseStatus: response.status,
+        responseBody,
+        expectedBody: testCase.expectedBody,
+        matchesExpected: normalizeComparableText(responseBody) === normalizeComparableText(testCase.expectedBody),
+      });
+    }
+
+    return checks;
+  }
+
+  private async toRequest(request: IncomingMessage, host: string, port: number): Promise<Request> {
+    const body = await this.readIncomingBody(request);
+    const url = new URL(request.url ?? "/", buildServiceUrl(host, port, "/"));
+    return new Request(url, {
+      method: request.method ?? "GET",
+      headers: request.headers as HeadersInit,
+      body: body.length > 0 ? new Uint8Array(body) : undefined,
+    });
+  }
+
+  private async readIncomingBody(request: IncomingMessage): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+
+    for await (const chunk of request) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+
+    return Buffer.concat(chunks);
+  }
+
+  private async writeResponse(response: ServerResponse, serviceResponse: Response): Promise<void> {
+    response.statusCode = serviceResponse.status;
+    serviceResponse.headers.forEach((value, key) => {
+      response.setHeader(key, value);
+    });
+    const body = Buffer.from(await serviceResponse.arrayBuffer());
+    response.end(body);
   }
 
   private async search(request: string | WorkerSearchRequest): Promise<WorkerSearchResponse> {
@@ -1554,7 +1575,7 @@ export class TaskWorkerService {
 
   private async appendProgressLog(phase: string, message: string): Promise<void> {
     const timestamp = new Date().toISOString();
-    console.log(`[worker:${this.runtime.serviceName}] ${phase}: ${message}`);
+    console.log(`[worker:${this.runtime.serviceName}] progress phase=${phase}`);
     await appendFile(this.resolveStoragePath("logs/progress.log"), `[${timestamp}] ${phase}: ${message}\n`, "utf8");
   }
 
@@ -1568,7 +1589,7 @@ export class TaskWorkerService {
     for (const toolCall of toolCalls) {
       const timestamp = new Date().toISOString();
       const logLine = `[${timestamp}] source=${source} tool=${toolCall.name} args=${toolCall.arguments}\n`;
-      console.log(`[worker:${this.runtime.serviceName}] tool: source=${source} name=${toolCall.name} args=${toolCall.arguments}`);
+      console.log(`[worker:${this.runtime.serviceName}] tool: source=${source} name=${toolCall.name}`);
       await appendFile(this.resolveStoragePath("logs/tools.log"), logLine, "utf8");
     }
   }
@@ -1602,12 +1623,14 @@ export class TaskWorkerService {
     aiPayload: unknown,
   ): IterationInstruction {
     const summary = extractIterationSummary(aiPayload) ?? "Updated app/index.ts";
+    const intent = extractIterationIntent(aiPayload) ?? "Advance the implementation toward a testable solution.";
     const notes = extractIterationNotes(aiPayload);
     const decision = extractIterationDecision(aiPayload) ?? "test";
     const appSource = selectAppSource(task, fallbackAppSource, aiPayload);
 
     return {
       decision,
+      intent,
       summary,
       notes,
       appSource,
@@ -1743,9 +1766,11 @@ export class TaskWorkerService {
       }
 
       const verifiedCompletion = await this.verifyCompletion(task, completion, []);
+      await this.stopActiveService();
       await this.appendProgressLog("start", "Existing app passed verification. skipping implementation mode");
       return verifiedCompletion;
     } catch (error) {
+      await this.stopActiveService();
       const reason = error instanceof Error ? error.message : "Existing app pre-check failed";
       await this.appendProgressLog("start", `Existing app assessment failed: ${reason}`);
       await this.emitProgress({
@@ -1828,638 +1853,5 @@ export class TaskWorkerService {
     if (instruction.wasTestDeferred && currentTaskStats.completed === previousTaskStats.completed && !appChanged) {
       throw new Error("Iteration made no task progress after test was deferred because tasks.json still had open items");
     }
-  }
-}
-
-function extractDiscoveryServices(payload: unknown): Array<{ name: string }> {
-  if (typeof payload !== "object" || payload === null) {
-    return [];
-  }
-
-  const candidate = payload as { services?: Array<{ name: string }> };
-  return Array.isArray(candidate.services) ? candidate.services : [];
-}
-
-function normalizeSearchRequest(request: string | WorkerSearchRequest): WorkerSearchRequest {
-  if (typeof request === "string") {
-    return { type: "search", query: request };
-  }
-
-  return request;
-}
-
-function normalizeSearchResponse(payload: unknown): WorkerSearchResponse {
-  if (typeof payload !== "object" || payload === null) {
-    throw new Error("Search returned an invalid response payload");
-  }
-
-  const candidate = payload as Partial<WorkerSearchResponse>;
-  if (candidate.type !== "search" || candidate.status !== "ok" || !Array.isArray(candidate.results) || typeof candidate.query !== "string") {
-    throw new Error("Search returned no usable search results");
-  }
-
-  return candidate as WorkerSearchResponse;
-}
-
-function normalizeSearchFailure(payload: unknown): { reason: string; code?: string } {
-  if (typeof payload !== "object" || payload === null) {
-    return { reason: "Unknown search module error" };
-  }
-
-  const candidate = payload as { reason?: unknown; code?: unknown };
-  return {
-    reason: typeof candidate.reason === "string" && candidate.reason.trim().length > 0
-      ? candidate.reason
-      : "Unknown search module error",
-    ...(typeof candidate.code === "string" && candidate.code.trim().length > 0 ? { code: candidate.code } : {}),
-  };
-}
-
-function createEmptySearchResponse(
-  requestId: string,
-  responder: string,
-  request: WorkerSearchRequest,
-  failure?: { reason: string; code?: string },
-): WorkerSearchResponse {
-  return {
-    requestId,
-    responder,
-    status: "ok",
-    type: "search",
-    query: request.query ?? "",
-    results: [],
-    sourcesTried: [],
-    sourcesSucceeded: [],
-    sourcesFailed: failure ? [{
-      source: responder,
-      reason: failure.reason,
-      ...(failure.code ? { code: failure.code } : {}),
-    }] : [],
-    dedupe: {
-      inputCount: 0,
-      uniqueCount: 0,
-      removedCount: 0,
-    },
-  };
-}
-
-function extractNamedFileContent(
-  aiPayload: unknown,
-  filePath: string,
-): string | undefined {
-  if (typeof aiPayload !== "object" || aiPayload === null) {
-    return undefined;
-  }
-
-  const payload = aiPayload as {
-    files?: Array<{ path?: string; content?: string }>;
-  };
-
-  return payload.files?.find((file) => file.path === filePath && typeof file.content === "string")?.content;
-}
-
-function selectAppSource(task: string, fallbackAppSource: string, aiPayload: unknown): string {
-  const appFile = extractNamedFileContent(aiPayload, "app/index.ts");
-  if (appFile) {
-    return appFile;
-  }
-
-  if (typeof aiPayload === "object" && aiPayload !== null) {
-    const payload = aiPayload as {
-      app?: { entry?: string; source?: string };
-      answer?: string;
-      message?: { content?: string };
-    };
-
-    if (payload.app?.source) {
-      return payload.app.source;
-    }
-
-    if (typeof payload.answer === "string") {
-      const fenced = extractAppCodeBlock(payload.answer);
-      if (fenced) {
-        return fenced;
-      }
-    }
-
-    if (payload.message && typeof payload.message === "object" && typeof (payload.message as { content?: unknown }).content === "string") {
-      const fenced = extractAppCodeBlock((payload.message as { content: string }).content);
-      if (fenced) {
-        return fenced;
-      }
-    }
-  }
-
-  if (fallbackAppSource.trim().length > 0) {
-    return fallbackAppSource;
-  }
-
-  return createDefaultAppTemplate(task);
-}
-
-function selectTaskListContent(aiPayload: unknown): WorkerTask[] {
-  const taskFile = extractNamedFileContent(aiPayload, "tasks.json");
-  if (taskFile) {
-    return parseTaskList(taskFile);
-  }
-
-  if (typeof aiPayload !== "object" || aiPayload === null) {
-    return [];
-  }
-
-  const payload = aiPayload as {
-    tasks?: unknown;
-    plan?: { tasks?: unknown };
-    answer?: unknown;
-    message?: { content?: unknown };
-  };
-
-  const directTasks = tryNormalizeTaskArray(payload.tasks);
-  if (directTasks.length > 0) {
-    return directTasks;
-  }
-
-  const plannedTasks = tryNormalizeTaskArray(payload.plan?.tasks);
-  if (plannedTasks.length > 0) {
-    return plannedTasks;
-  }
-
-  const texts = [
-    typeof payload.answer === "string" ? payload.answer : undefined,
-    typeof payload.message?.content === "string" ? payload.message.content : undefined,
-  ].filter((value): value is string => Boolean(value));
-
-  for (const text of texts) {
-    const parsed = tryParseJson(text);
-    if (typeof parsed !== "object" || parsed === null) {
-      continue;
-    }
-
-    const tasks = tryNormalizeTaskArray((parsed as { tasks?: unknown }).tasks);
-    if (tasks.length > 0) {
-      return tasks;
-    }
-  }
-
-  return [];
-}
-
-function extractAppCodeBlock(text: string): string | undefined {
-  const codeBlockPattern = /```([^\n]*)\n([\s\S]*?)```/g;
-  const candidates: Array<{ language: string; content: string }> = [];
-
-  for (const match of text.matchAll(codeBlockPattern)) {
-    candidates.push({
-      language: match[1]?.trim().toLowerCase() ?? "",
-      content: match[2] ?? "",
-    });
-  }
-
-  const preferred = candidates.find((candidate) => looksLikeAppSource(candidate.content) && isTypeScriptFence(candidate.language));
-  if (preferred) {
-    return preferred.content;
-  }
-
-  const plausible = candidates.find((candidate) => looksLikeAppSource(candidate.content));
-  if (plausible) {
-    return plausible.content;
-  }
-
-  return undefined;
-}
-
-function looksLikeAppSource(content: string): boolean {
-  const trimmed = content.trim();
-  if (!trimmed || looksLikeTasksContent(trimmed)) {
-    return false;
-  }
-
-  return /\bexport\s+default\s+async\s+function\s+run\s*\(\s*host\s*\)/.test(trimmed)
-    || /\bhost\.(?:readFile|writeFile|appendProgress|readTask|readMemory|writeMemory|search|completeTask|failTask)\s*\(/.test(trimmed);
-}
-
-function looksLikeTasksContent(content: string): boolean {
-  return /^\s*\{\s*"tasks"\s*:/m.test(content);
-}
-
-function isTypeScriptFence(language: string): boolean {
-  return language === "ts" || language === "typescript";
-}
-
-function extractToolCalls(payload: unknown): Array<{ name: string; arguments: string }> {
-  if (typeof payload !== "object" || payload === null) {
-    return [];
-  }
-
-  const candidate = payload as {
-    toolCalls?: Array<{ name?: unknown; arguments?: unknown }>;
-    message?: { toolCalls?: Array<{ name?: unknown; arguments?: unknown }> };
-  };
-
-  const rawToolCalls = Array.isArray(candidate.toolCalls)
-    ? candidate.toolCalls
-    : Array.isArray(candidate.message?.toolCalls)
-      ? candidate.message.toolCalls
-      : [];
-
-  return rawToolCalls
-    .filter((toolCall) => typeof toolCall?.name === "string" && typeof toolCall?.arguments === "string")
-    .map((toolCall) => ({
-      name: toolCall.name as string,
-      arguments: toolCall.arguments as string,
-    }));
-}
-
-function extractAssistantResponseMessage(payload: unknown): AiAssistantResponseMessage {
-  if (typeof payload === "object" && payload !== null) {
-    const candidate = payload as {
-      message?: {
-        role?: unknown;
-        content?: unknown;
-        refusal?: unknown;
-        toolCalls?: unknown;
-      };
-      answer?: unknown;
-      toolCalls?: unknown;
-    };
-
-    if (candidate.message && typeof candidate.message === "object") {
-      const toolCalls = normalizeAiToolCalls(candidate.message.toolCalls);
-      return {
-        role: "assistant",
-        ...(typeof candidate.message.content === "string" ? { content: candidate.message.content } : {}),
-        ...(typeof candidate.message.refusal === "string" ? { refusal: candidate.message.refusal } : {}),
-        ...(toolCalls.length > 0 ? { toolCalls } : {}),
-      };
-    }
-
-    const toolCalls = normalizeAiToolCalls(candidate.toolCalls);
-    return {
-      role: "assistant",
-      ...(typeof candidate.answer === "string" ? { content: candidate.answer } : {}),
-      ...(toolCalls.length > 0 ? { toolCalls } : {}),
-    };
-  }
-
-  return {
-    role: "assistant",
-    content: typeof payload === "string" ? payload : "",
-  };
-}
-
-function normalizeAiToolCalls(value: unknown): AiToolCallMessage[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value
-    .filter((toolCall) => (
-      typeof toolCall === "object"
-      && toolCall !== null
-      && (toolCall as { type?: unknown }).type === "function"
-      && typeof (toolCall as { id?: unknown }).id === "string"
-      && typeof (toolCall as { name?: unknown }).name === "string"
-      && typeof (toolCall as { arguments?: unknown }).arguments === "string"
-    ))
-    .map((toolCall) => ({
-      id: (toolCall as { id: string }).id,
-      type: "function",
-      name: (toolCall as { name: string }).name,
-      arguments: (toolCall as { arguments: string }).arguments,
-    }));
-}
-
-function requireStringArg(value: unknown, key: string): string {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    throw new Error(`AI tool argument '${key}' must be a non-empty string`);
-  }
-
-  return value;
-}
-
-function normalizePositiveInteger(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
-}
-
-function summarizeLine(line: string): string {
-  const normalized = line.trim().replace(/\s+/g, " ");
-  return normalized.length > 160 ? `${normalized.slice(0, 157)}...` : normalized;
-}
-
-function extractIterationDecision(payload: unknown): "continue" | "test" | undefined {
-  if (typeof payload !== "object" || payload === null) {
-    return undefined;
-  }
-
-  const candidate = payload as {
-    decision?: unknown;
-    nextAction?: unknown;
-    plan?: { decision?: unknown };
-    answer?: unknown;
-    message?: { content?: unknown };
-  };
-
-  const direct = [candidate.decision, candidate.nextAction, candidate.plan?.decision];
-  for (const value of direct) {
-    if (value === "continue" || value === "test") {
-      return value;
-    }
-  }
-
-  const text = [
-    typeof candidate.answer === "string" ? candidate.answer : undefined,
-    typeof candidate.message?.content === "string" ? candidate.message.content : undefined,
-  ].filter((value): value is string => Boolean(value)).join("\n");
-
-  if (/\bdecision\s*:\s*continue\b/i.test(text) || /\bnext(?: action)?\s*:\s*continue\b/i.test(text)) {
-    return "continue";
-  }
-
-  if (/\bdecision\s*:\s*test\b/i.test(text) || /\bnext(?: action)?\s*:\s*test\b/i.test(text)) {
-    return "test";
-  }
-
-  return undefined;
-}
-
-function extractIterationSummary(payload: unknown): string | undefined {
-  if (typeof payload !== "object" || payload === null) {
-    return undefined;
-  }
-
-  const candidate = payload as {
-    summary?: unknown;
-    notes?: unknown;
-    plan?: { summary?: unknown };
-    answer?: unknown;
-    message?: { content?: unknown };
-  };
-
-  if (typeof candidate.summary === "string" && candidate.summary.trim().length > 0) {
-    return candidate.summary.trim();
-  }
-
-  if (typeof candidate.plan?.summary === "string" && candidate.plan.summary.trim().length > 0) {
-    return candidate.plan.summary.trim();
-  }
-
-  const text = [
-    typeof candidate.answer === "string" ? candidate.answer : undefined,
-    typeof candidate.message?.content === "string" ? candidate.message.content : undefined,
-  ].filter((value): value is string => Boolean(value)).join("\n");
-
-  const match = text.match(/\bsummary\s*:\s*(.+)/i);
-  return match?.[1]?.trim();
-}
-
-function extractIterationNotes(payload: unknown): string | undefined {
-  if (typeof payload !== "object" || payload === null) {
-    return undefined;
-  }
-
-  const candidate = payload as {
-    notes?: unknown;
-    plan?: { notes?: unknown };
-    answer?: unknown;
-    message?: { content?: unknown };
-  };
-
-  if (typeof candidate.notes === "string" && candidate.notes.trim().length > 0) {
-    return candidate.notes.trim();
-  }
-
-  if (typeof candidate.plan?.notes === "string" && candidate.plan.notes.trim().length > 0) {
-    return candidate.plan.notes.trim();
-  }
-
-  const text = [
-    typeof candidate.answer === "string" ? candidate.answer : undefined,
-    typeof candidate.message?.content === "string" ? candidate.message.content : undefined,
-  ].filter((value): value is string => Boolean(value)).join("\n");
-
-  const match = text.match(/\bnotes?\s*:\s*([\s\S]+)/i);
-  return match?.[1]?.trim();
-}
-
-function extractVerificationSummary(payload: unknown): string | undefined {
-  if (typeof payload !== "object" || payload === null) {
-    return undefined;
-  }
-
-  const candidate = payload as {
-    answer?: unknown;
-    message?: { content?: unknown };
-  };
-
-  if (typeof candidate.answer === "string" && candidate.answer.trim().length > 0) {
-    return candidate.answer.trim();
-  }
-
-  if (typeof candidate.message?.content === "string" && candidate.message.content.trim().length > 0) {
-    return candidate.message.content.trim();
-  }
-
-  return undefined;
-}
-
-function extractMemoryContent(payload: unknown): string | undefined {
-  if (typeof payload === "string" && payload.trim().length > 0) {
-    return payload.trim();
-  }
-
-  if (typeof payload !== "object" || payload === null) {
-    return undefined;
-  }
-
-  const candidate = payload as {
-    memory?: unknown;
-    answer?: unknown;
-    message?: { content?: unknown };
-  };
-
-  if (typeof candidate.memory === "string" && candidate.memory.trim().length > 0) {
-    return candidate.memory.trim();
-  }
-
-  if (typeof candidate.answer === "string" && candidate.answer.trim().length > 0) {
-    return candidate.answer.trim();
-  }
-
-  if (typeof candidate.message?.content === "string" && candidate.message.content.trim().length > 0) {
-    return candidate.message.content.trim();
-  }
-
-  return undefined;
-}
-
-function extractVerificationOutcome(payload: unknown): { verified: boolean; summary?: string } {
-  const summary = extractVerificationSummary(payload);
-
-  if (!summary) {
-    return { verified: false };
-  }
-
-  const normalized = summary.trim().toLowerCase();
-
-  if (isNegativeVerification(normalized)) {
-    return { verified: false, summary };
-  }
-
-  if (isPositiveVerification(normalized)) {
-    return { verified: true, summary };
-  }
-
-  return { verified: false, summary };
-}
-
-function isPositiveVerification(summary: string): boolean {
-  return /\b(valid|verified|verification:\s*result matches|satisf(?:y|ies|ied)|pass(?:ed|es)?|correct)\b/.test(summary)
-    && !isNegativeVerification(summary);
-}
-
-function isNegativeVerification(summary: string): boolean {
-  return /\b(invalid|not valid|reject(?:ed|s)?|fail(?:ed|s)?|does not satisfy|doesn't satisfy|missing|insufficient|incorrect|not verified|unverified)\b/.test(summary);
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function normalizeProgressUpdate(payload: string | ProgressUpdatePayload): Required<ProgressUpdatePayload> {
-  if (typeof payload === "string") {
-    return {
-      phase: "app",
-      message: payload,
-      updatedFiles: [],
-    };
-  }
-
-  return {
-    phase: payload.phase,
-    message: payload.message,
-    updatedFiles: payload.updatedFiles ?? [],
-  };
-}
-
-function normalizeCompletionPayload(
-  payload: string | { summary: string; resultFile?: string },
-): { summary: string; resultFile?: string } {
-  if (typeof payload === "string") {
-    return { summary: payload };
-  }
-
-  return payload;
-}
-
-function normalizeFailurePayload(payload: string | { summary: string }): { summary: string } {
-  if (typeof payload === "string") {
-    return { summary: payload };
-  }
-
-  return payload;
-}
-
-function formatPlanningMessage(
-  iteration: number,
-  instruction: { decision: "continue" | "test"; summary: string },
-): string {
-  const summary = instruction.summary.trim();
-
-  if (instruction.decision === "continue") {
-    return `planning next implementation step ${iteration}. updating app/index.ts and reviewing tasks.json. ${summary}`;
-  }
-
-  return `planning final implementation step ${iteration}. updating app/index.ts and reviewing tasks.json. deciding work is complete. start test. ${summary}`;
-}
-
-function taskListHasOpenItems(tasks: WorkerTask[]): boolean {
-  return tasks.some((task) => task.status === "open");
-}
-
-function normalizeForProgressComparison(content: string): string {
-  return content.replace(/\r\n/g, "\n").trim();
-}
-
-function normalizeTaskListForProgressComparison(tasks: WorkerTask[]): string {
-  return JSON.stringify(tasks.map((task) => ({
-    id: task.id,
-    title: task.title,
-    status: task.status,
-  })));
-}
-
-function getTaskStats(tasks: WorkerTask[]): { completed: number; open: number } {
-  let completed = 0;
-  let open = 0;
-
-  for (const task of tasks) {
-    if (task.status === "done") {
-      completed += 1;
-    } else if (task.status === "open") {
-      open += 1;
-    }
-  }
-
-  return { completed, open };
-}
-
-function parseTaskList(raw: string): WorkerTask[] {
-  if (!raw.trim()) {
-    return [];
-  }
-
-  const parsed = JSON.parse(raw) as { tasks?: unknown };
-  if (!Array.isArray(parsed.tasks)) {
-    throw new Error("tasks.json must contain a top-level tasks array");
-  }
-
-  return parsed.tasks.map((task, index) => normalizeTaskRecord(task, index));
-}
-
-function tryNormalizeTaskArray(value: unknown): WorkerTask[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value.map((task, index) => normalizeTaskRecord(task, index));
-}
-
-function normalizeTaskRecord(task: unknown, index: number): WorkerTask {
-  if (typeof task !== "object" || task === null) {
-    throw new Error(`tasks.json contains a non-object task at index ${index}`);
-  }
-
-  const candidate = task as Partial<WorkerTask>;
-  if (typeof candidate.id !== "string" || typeof candidate.title !== "string") {
-    throw new Error(`tasks.json contains an invalid task at index ${index}`);
-  }
-
-  return {
-    id: candidate.id,
-    title: candidate.title,
-    status: requireTaskStatusArg(candidate.status, "status"),
-  };
-}
-
-function isMissingFileError(error: unknown): boolean {
-  return typeof error === "object"
-    && error !== null
-    && "code" in error
-    && (error as { code?: unknown }).code === "ENOENT";
-}
-
-function requireTaskStatusArg(value: unknown, name: string): WorkerTaskStatus {
-  if (value === "open" || value === "done") {
-    return value;
-  }
-
-  throw new Error(`${name} must be 'open' or 'done'`);
-}
-
-function tryParseJson(value: string): unknown {
-  try {
-    return JSON.parse(value);
-  } catch {
-    return undefined;
   }
 }

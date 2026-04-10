@@ -280,6 +280,65 @@ test("AzureAIProvider uses api-key header", async () => {
   });
 });
 
+test("AzureAIProvider waits at least 60 seconds before retrying rate limits", async () => {
+  const seenDelays: number[] = [];
+  let attempts = 0;
+
+  const provider = new AzureAIProvider({
+    apiKey: "azure-key",
+    model: "gpt-4.1-mini",
+    serviceName: "ai:1",
+    baseUrl: "https://example.openai.azure.com/openai/v1",
+    sleepImpl: async (delayMs) => {
+      seenDelays.push(delayMs);
+    },
+    fetchImpl: async () => {
+      attempts += 1;
+
+      if (attempts === 1) {
+        return new Response(JSON.stringify({
+          error: {
+            message: "Too Many Requests",
+            type: "too_many_requests",
+            code: "too_many_requests",
+          },
+        }), {
+          status: 429,
+          headers: {
+            "Content-Type": "application/json",
+            "Retry-After": "5",
+          },
+        });
+      }
+
+      return new Response(JSON.stringify({
+        model: "gpt-4.1-mini",
+        choices: [
+          {
+            message: {
+              content: "Azure retried response",
+            },
+          },
+        ],
+      }), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+    },
+  });
+
+  const response = await provider.complete("req-azure-retry", {
+    type: "completion",
+    messages: [{ role: "user", content: "hello" }],
+  });
+
+  assert.equal(attempts, 2);
+  assert.deepEqual(seenDelays, [60_000]);
+  assert.equal(response.answer, "Azure retried response");
+});
+
 test("OpenRouterProvider sets optional attribution headers", async () => {
   let headers: HeadersInit | undefined;
   let requestBody: Record<string, unknown> | undefined;

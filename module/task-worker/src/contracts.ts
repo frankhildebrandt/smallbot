@@ -21,6 +21,21 @@ export interface CompletionPayload {
   summary: string;
   resultFile?: string;
   verificationSummary?: string;
+  service?: {
+    host: string;
+    port: number;
+    path?: string;
+    url: string;
+    observedStatus?: number;
+    observedBody?: string;
+    checks?: Array<{
+      requestBody: string;
+      responseStatus: number;
+      responseBody: string;
+      expectedBody?: string;
+      matchesExpected?: boolean;
+    }>;
+  };
 }
 
 export interface FailurePayload {
@@ -104,6 +119,21 @@ export interface WorkerRunResult {
   summary: string;
   resultFile?: string;
   verificationSummary?: string;
+  service?: {
+    host: string;
+    port: number;
+    path?: string;
+    url: string;
+    observedStatus?: number;
+    observedBody?: string;
+    checks?: Array<{
+      requestBody: string;
+      responseStatus: number;
+      responseBody: string;
+      expectedBody?: string;
+      matchesExpected?: boolean;
+    }>;
+  };
 }
 
 export interface PendingRequest {

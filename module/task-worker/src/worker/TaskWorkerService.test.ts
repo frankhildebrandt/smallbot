@@ -8,7 +8,7 @@ import test from "node:test";
 import { WireMessage } from "@smallbot/framework";
 
 import { TaskWorkerService } from "./TaskWorkerService.js";
-import { WorkerRuntime } from "./contracts.js";
+import { WorkerRuntime } from "../contracts.js";
 
 class RuntimeStub implements WorkerRuntime {
   readonly sent: WireMessage[] = [];
@@ -157,7 +157,7 @@ test("worker uses an existing app first when it already solves the task", async 
   await assert.rejects(access(path.join(dataPath, "tasks.json")));
 });
 
-test("worker verification for an existing service app includes source and summary when no result file exists", async (t) => {
+test("worker verification for an existing service app includes observed service output when no result file exists", async (t) => {
   const dataPath = await createDataDir();
   const runtime = new RuntimeStub("worker:1");
   const service = new TaskWorkerService(runtime, { dataPath, aiKind: "ai", aiTarget: "ai:1" });
@@ -166,7 +166,15 @@ test("worker verification for an existing service app includes source and summar
   await mkdir(path.join(dataPath, "app"), { recursive: true });
   await writeFile(path.join(dataPath, "task.md"), "reuse existing service app", "utf8");
   await writeFile(path.join(dataPath, "app", "index.ts"), `export default async function run(host) {
-  await host.completeTask("ready on 0.0.0.0:5080");
+  await host.serveHttp({
+    host: "127.0.0.1",
+    port: 5080,
+    fetch: async () => new Response("service says hello", {
+      status: 200,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+    }),
+  });
+  await host.markReady({ summary: "ready on 127.0.0.1:5080", host: "127.0.0.1", port: 5080 });
 }
 `, "utf8");
 
@@ -183,9 +191,11 @@ test("worker verification for an existing service app includes source and summar
 
   const verificationRequest = await waitForAiTool(runtime, 1);
   const verificationPayload = JSON.stringify(verificationRequest.m);
-  assert.match(verificationPayload, /ready on 0\.0\.0\.0:5080/);
+  assert.match(verificationPayload, /ready on 127\.0\.0\.1:5080/);
   assert.match(verificationPayload, /export default async function run\(host\)/);
   assert.match(verificationPayload, /appSource/);
+  assert.match(verificationPayload, /service says hello/);
+  assert.match(verificationPayload, /observedStatus/);
 
   await service.onMessage({
     s: "ai:1",
@@ -1909,6 +1919,7 @@ test("worker can iterate with continue before testing and grows working context"
   await waitFor(() => runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool").length >= 1);
   const firstRequest = runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool")[0];
   assert.ok(firstRequest);
+  assert.match(JSON.stringify(firstRequest.m), /\\"intent\\":\s*\\"short reason for this implementation step and what it is meant to achieve\\"/);
 
   await service.onMessage({
     s: "ai:1",
@@ -1917,6 +1928,7 @@ test("worker can iterate with continue before testing and grows working context"
     i: firstRequest.i,
     m: {
       decision: "continue",
+      intent: "Create the first runnable API skeleton so later iterations can wire the route behavior.",
       summary: "scaffolded api server",
       notes: "keep iterating",
       files: createAiFiles(
@@ -1932,6 +1944,7 @@ test("worker can iterate with continue before testing and grows working context"
   await waitFor(() => runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool").length >= 2);
   const secondRequest = runtime.sent.filter((message) => message.t === "ai:1" && message.c === "tool")[1];
   assert.ok(secondRequest);
+  assert.match(JSON.stringify(secondRequest.m), /Create the first runnable API skeleton so later iterations can wire the route behavior\./);
   assert.match(JSON.stringify(secondRequest.m), /scaffolded api server/);
   assert.match(JSON.stringify(secondRequest.m), /continue/);
 
@@ -1942,6 +1955,7 @@ test("worker can iterate with continue before testing and grows working context"
     i: secondRequest.i,
     m: {
       decision: "test",
+      intent: "Finish the remaining route work so the worker can stop iterating and run verification.",
       summary: "ready to test",
       files: createAiFiles(
         `export default async function run(host) {
@@ -2553,6 +2567,7 @@ test("worker emits clear step-by-step progress messages", async (t) => {
     i: firstRequest.i,
     m: {
       decision: "continue",
+      intent: "Clarify the response shape before writing the result file.",
       summary: "planning api shape",
       files: createAiFiles(
         `export default async function run(host) {
@@ -2575,6 +2590,7 @@ test("worker emits clear step-by-step progress messages", async (t) => {
     i: secondRequest.i,
     m: {
       decision: "test",
+      intent: "Write the final result path so the smoke test can run against a finished implementation.",
       summary: "ready for smoke test",
       files: createAiFiles(
         `export default async function run(host) {
@@ -2728,6 +2744,97 @@ test("worker clears working context after memorizing failure and keeps memory", 
   assert.equal(await readFile(path.join(dataPath, "memory.md"), "utf8"), "Remember the failed test result.");
   assert.match(await readFile(path.join(dataPath, "logs", "progress.log"), "utf8"), /Cleared implementation working context after memorizing failed attempt/);
   assert.match(await readFile(path.join(dataPath, "logs", "progress.log"), "utf8"), /Cleared implementation working context after completed run/);
+});
+
+test("worker console logs exclude task and tool content", async (t) => {
+  const dataPath = await createDataDir();
+  const runtime = new RuntimeStub("worker:1");
+  const service = new TaskWorkerService(runtime, { dataPath, aiKind: "ai", aiTarget: "ai:1" });
+
+  await writeFile(path.join(dataPath, "task.md"), "secret task body should stay out of stdout", "utf8");
+
+  const originalConsoleLog = console.log;
+  const lines: string[] = [];
+  console.log = (...args: unknown[]) => {
+    lines.push(args.map((arg) => String(arg)).join(" "));
+  };
+
+  t.after(async () => {
+    console.log = originalConsoleLog;
+    await rm(dataPath, { recursive: true, force: true });
+  });
+
+  const runPromise = service.onMessage({
+    s: "agent:1",
+    t: "worker:1",
+    c: "tool",
+    i: "req-console-redaction",
+  });
+
+  const aiRequest = await waitForAiTool(runtime, 1);
+  assert.ok(aiRequest);
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: aiRequest.i,
+    m: {
+      toolCalls: [
+        {
+          id: "tool-1",
+          type: "function",
+          name: "write_file",
+          arguments: JSON.stringify({
+            path: "app/index.ts",
+            content: `export default async function run(host) {
+  await host.completeTask({ summary: "very secret summary", resultFile: "result.md" });
+}
+`,
+          }),
+        },
+      ],
+    },
+  });
+
+  const followUpRequest = await waitForAiTool(runtime, 2);
+  assert.ok(followUpRequest);
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: followUpRequest.i,
+    m: {
+      decision: "test",
+      intent: "Finalize the repaired app so verification can run without exposing task content.",
+      summary: "very secret summary",
+      files: createAiFiles(`export default async function run(host) {
+  await host.completeTask({ summary: "very secret summary", resultFile: "result.md" });
+}
+`, "# TODO\n- [x] Review existing app\n"),
+    },
+  });
+
+  const verificationRequest = await waitForAiTool(runtime, 3);
+  assert.ok(verificationRequest);
+
+  await service.onMessage({
+    s: "ai:1",
+    t: "worker:1",
+    c: "result",
+    i: verificationRequest.i,
+    m: { answer: "VALID: repaired" },
+  });
+
+  await runPromise;
+
+  const output = lines.join("\n");
+  assert.doesNotMatch(output, /secret task body should stay out of stdout/);
+  assert.doesNotMatch(output, /very secret summary/);
+  assert.match(output, /\[worker:worker:1\] intent iteration=1 decision=test reason=Finalize the repaired app so verification can run without exposing task content\./);
+  assert.match(output, /\[worker:worker:1\] progress phase=/);
+  assert.match(output, /\[worker:worker:1\] tool: source=iteration name=write_file/);
 });
 
 async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {

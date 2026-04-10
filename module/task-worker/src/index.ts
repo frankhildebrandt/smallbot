@@ -1,6 +1,6 @@
 import { ModuleRuntime, WireMessage } from "@smallbot/framework";
 
-import { TaskWorkerService } from "./TaskWorkerService.js";
+import { TaskWorkerService } from "./worker/TaskWorkerService.js";
 import type { WorkerAiToolName } from "./contracts.js";
 
 const serviceName = process.env.SERVICE_NAME ?? "worker:1";
