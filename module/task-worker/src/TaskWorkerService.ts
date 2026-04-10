@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { watch, type FSWatcher } from "node:fs";
 import { access, appendFile, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { exec as execCallback } from "node:child_process";
+import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 
 import { WireMessage, createMessage } from "@smallbot/framework";
@@ -18,7 +20,10 @@ import {
   WorkerSearchRequest,
   WorkerSearchResponse,
 } from "./contracts.js";
+import type { WorkerAiToolName } from "./contracts.js";
 import { createDefaultAppTemplate } from "./defaultAppTemplate.js";
+
+const exec = promisify(execCallback);
 
 interface WorkerHost {
   readFile(filePath: string): Promise<string>;
@@ -32,12 +37,20 @@ interface WorkerHost {
   failTask(payload: string | { summary: string }): Promise<void>;
 }
 
+type WorkerTaskStatus = "open" | "done";
+
+interface WorkerTask {
+  id: string;
+  title: string;
+  status: WorkerTaskStatus;
+}
+
 interface IterationContextEntry {
   iteration: number;
   decision: "continue" | "test";
   summary: string;
   notes?: string;
-  todo: string;
+  tasks: WorkerTask[];
   appSource: string;
   updatedFiles: string[];
 }
@@ -46,7 +59,6 @@ interface IterationInstruction {
   decision: "continue" | "test";
   summary: string;
   notes?: string;
-  todo: string;
   appSource: string;
   wasTestDeferred?: boolean;
 }
@@ -55,7 +67,7 @@ interface PromptContext {
   task: string;
   memory: string;
   existingAppSource: string;
-  todo: string;
+  tasks: WorkerTask[];
   workingContext: IterationContextEntry[];
   progressLog: string;
   contextLog: string;
@@ -75,14 +87,173 @@ interface FailedAttemptSnapshot {
   error: string;
   workingContext: IterationContextEntry[];
   appSource: string;
-  todo: string;
+  tasks: WorkerTask[];
 }
+
+interface AiFunctionToolDefinition {
+  type: "function";
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+}
+
+interface AiToolCallMessage {
+  id: string;
+  type: "function";
+  name: string;
+  arguments: string;
+}
+
+interface AiAssistantResponseMessage {
+  role: "assistant";
+  content?: string;
+  refusal?: string;
+  toolCalls?: AiToolCallMessage[];
+}
+
+interface AiToolResponseMessage {
+  role: "tool";
+  content: string;
+  toolCallId: string;
+}
+
+interface AiInferenceToolUseRequest {
+  type: "tool_use";
+  system?: string;
+  messages: Array<
+    | { role: "user"; content: string }
+    | AiAssistantResponseMessage
+    | AiToolResponseMessage
+  >;
+  tools: AiFunctionToolDefinition[];
+  toolChoice?: "auto" | "required" | "none";
+}
+
+const IMPLEMENTATION_TOOLS: Array<AiFunctionToolDefinition & { name: WorkerAiToolName }> = [
+  {
+    type: "function",
+    name: "list_files",
+    description: "List files under the worker storage root.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Optional relative directory inside storage." },
+        limit: { type: "number", description: "Maximum number of paths to return." },
+      },
+    },
+  },
+  {
+    type: "function",
+    name: "read_file",
+    description: "Read a UTF-8 text file from worker storage.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Relative file path inside storage." },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    type: "function",
+    name: "write_file",
+    description: "Write a UTF-8 text file inside worker storage.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Relative file path inside storage." },
+        content: { type: "string", description: "Full replacement file content." },
+      },
+      required: ["path", "content"],
+    },
+  },
+  {
+    type: "function",
+    name: "search_files",
+    description: "Search file paths and text contents inside worker storage.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Plain-text query to search for." },
+        path: { type: "string", description: "Optional relative directory inside storage." },
+        limit: { type: "number", description: "Maximum number of matches to return." },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    type: "function",
+    name: "create_task",
+    description: "Create a new open implementation task managed by the worker.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Short task title." },
+      },
+      required: ["title"],
+    },
+  },
+  {
+    type: "function",
+    name: "update_task",
+    description: "Update an existing worker-managed implementation task.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Existing task id." },
+        status: { type: "string", description: "Task status: open or done." },
+        title: { type: "string", description: "Optional replacement task title." },
+      },
+      required: ["id", "status"],
+    },
+  },
+  {
+    type: "function",
+    name: "list_tasks",
+    description: "List the current worker-managed implementation tasks.",
+    parameters: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    type: "function",
+    name: "web_search",
+    description: "Search the web through the configured search module.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        limit: { type: "number" },
+        language: { type: "string" },
+        region: { type: "string" },
+        safeSearch: { type: "string" },
+        site: { type: "string" },
+        freshness: { type: "string" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    type: "function",
+    name: "execute_typescript",
+    description: "Execute arbitrary TypeScript with full Node.js access. Use this for package installs, shell commands, code generation, or any implementation step best handled by running TypeScript directly.",
+    parameters: {
+      type: "object",
+      properties: {
+        script: { type: "string", description: "TypeScript source code to execute." },
+      },
+      required: ["script"],
+    },
+  },
+];
 
 export class TaskWorkerService {
   static readonly DISCOVERY_ATTEMPTS = 5;
   static readonly DISCOVERY_RETRY_DELAY_MS = 150;
   static readonly MESSAGE_BUS_TIMEOUT_MS = 30_000;
   static readonly RUN_RETRY_DELAY_MS = 1_000;
+  static readonly AI_TOOL_LOOP_MAX_ROUNDS = 12;
 
   readonly #pending = new Map<string, PendingRequest>();
   #activeRun?: Promise<void>;
@@ -220,15 +391,444 @@ export class TaskWorkerService {
   }
 
   async askAi(prompt: string): Promise<WireMessage> {
+    return this.askAiRequest({
+      kind: "task-worker:generate-app",
+      prompt,
+      requestId: this.#currentRequestId,
+    });
+  }
+
+  private async askAiRequest(payload: unknown): Promise<WireMessage> {
     const target = this.config.aiTarget
       ?? this.#resolvedAiTarget
       ?? (this.#resolvedAiTarget = await this.discoverTarget(this.config.aiKind, "AI"));
 
-    return this.requestToolMessage(target, {
-      kind: "task-worker:generate-app",
-      prompt,
-      requestId: this.#currentRequestId,
-    }, "Timed out waiting for AI response");
+    return this.requestToolMessage(target, payload, "Timed out waiting for AI response");
+  }
+
+  private createImplementationTools(): AiFunctionToolDefinition[] {
+    return IMPLEMENTATION_TOOLS.filter((tool) => this.isToolEnabled(tool.name));
+  }
+
+  private isToolEnabled(toolName: WorkerAiToolName): boolean {
+    return this.config.enabledTools?.[toolName] ?? true;
+  }
+
+  private async runAiWithWorkerTools(request: AiInferenceToolUseRequest, source: string): Promise<unknown> {
+    let currentRequest = request;
+
+    for (let round = 1; round <= TaskWorkerService.AI_TOOL_LOOP_MAX_ROUNDS; round += 1) {
+      const response = await this.askAiRequest(currentRequest);
+      await this.logAiTools(response.m, source);
+
+      const assistantMessage = extractAssistantResponseMessage(response.m);
+      const toolCalls = assistantMessage.toolCalls ?? [];
+      const supportedToolNames = new Set(currentRequest.tools.map((tool) => tool.name));
+      const executableToolCalls = toolCalls.filter((toolCall) => supportedToolNames.has(toolCall.name));
+
+      if (toolCalls.length === 0 || executableToolCalls.length === 0 || executableToolCalls.length !== toolCalls.length) {
+        return response.m;
+      }
+
+      const toolResponses: AiToolResponseMessage[] = [];
+      for (const toolCall of executableToolCalls) {
+        const content = await this.executeWorkerToolCall(toolCall, source);
+        toolResponses.push({
+          role: "tool",
+          content,
+          toolCallId: toolCall.id,
+        });
+      }
+
+      currentRequest = {
+        ...currentRequest,
+        messages: [
+          ...currentRequest.messages,
+          assistantMessage,
+          ...toolResponses,
+        ],
+      };
+    }
+
+    throw new Error(`AI tool loop exceeded ${TaskWorkerService.AI_TOOL_LOOP_MAX_ROUNDS} rounds`);
+  }
+
+  private async executeWorkerToolCall(toolCall: AiToolCallMessage, source: string): Promise<string> {
+    let args: Record<string, unknown>;
+    try {
+      args = toolCall.arguments.trim().length > 0
+        ? JSON.parse(toolCall.arguments) as Record<string, unknown>
+        : {};
+    } catch {
+      throw new Error(`AI tool call ${toolCall.name} used invalid JSON arguments`);
+    }
+
+    switch (toolCall.name) {
+      case "list_files":
+        return JSON.stringify(await this.aiToolListFiles(args), null, 2);
+      case "read_file":
+        return JSON.stringify(await this.aiToolReadFile(args, source), null, 2);
+      case "write_file":
+        return JSON.stringify(await this.aiToolWriteFile(args, source), null, 2);
+      case "search_files":
+        return JSON.stringify(await this.aiToolSearchFiles(args), null, 2);
+      case "create_task":
+        return JSON.stringify(await this.aiToolCreateTask(args), null, 2);
+      case "update_task":
+        return JSON.stringify(await this.aiToolUpdateTask(args), null, 2);
+      case "list_tasks":
+        return JSON.stringify(await this.aiToolListTasks(), null, 2);
+      case "web_search":
+        return JSON.stringify(await this.aiToolWebSearch(args), null, 2);
+      case "execute_typescript":
+        return JSON.stringify(await this.aiToolExecuteTypescript(args), null, 2);
+      default:
+        throw new Error(`Unsupported AI tool call: ${toolCall.name}`);
+    }
+  }
+
+  private async aiToolListFiles(args: Record<string, unknown>): Promise<{ path: string; files: string[]; truncated: boolean }> {
+    const relativeDir = typeof args.path === "string" && args.path.trim().length > 0 ? args.path : ".";
+    const limit = normalizePositiveInteger(args.limit, 200);
+    const rootPath = this.resolveStoragePath(relativeDir);
+    const files = await this.collectFiles(rootPath, limit);
+    return {
+      path: relativeDir,
+      files: files.map((filePath) => path.relative(this.config.dataPath, filePath)),
+      truncated: files.length >= limit,
+    };
+  }
+
+  private async aiToolReadFile(
+    args: Record<string, unknown>,
+    source: string,
+  ): Promise<{ path: string; exists: boolean; content: string }> {
+    const relativePath = requireStringArg(args.path, "path");
+    this.validateAiToolPath(relativePath, source, "read");
+    const fullPath = this.resolveStoragePath(relativePath);
+
+    try {
+      const content = await readFile(fullPath, "utf8");
+      return {
+        path: relativePath,
+        exists: true,
+        content,
+      };
+    } catch (error) {
+      if (isMissingFileError(error)) {
+        return {
+          path: relativePath,
+          exists: false,
+          content: "",
+        };
+      }
+
+      throw error;
+    }
+  }
+
+  private async aiToolWriteFile(args: Record<string, unknown>, source: string): Promise<{ path: string; bytes: number; source: string }> {
+    const relativePath = requireStringArg(args.path, "path");
+    const content = requireStringArg(args.content, "content");
+    this.validateAiToolPath(relativePath, source, "write");
+    const fullPath = this.resolveStoragePath(relativePath);
+    await mkdir(path.dirname(fullPath), { recursive: true });
+    await writeFile(fullPath, content, "utf8");
+    await this.appendProgressLog(source === "memory" ? "experience" : "implementation:iterating", `AI tool wrote ${relativePath}`);
+    return {
+      path: relativePath,
+      bytes: Buffer.byteLength(content, "utf8"),
+      source,
+    };
+  }
+
+  private async aiToolSearchFiles(args: Record<string, unknown>): Promise<{ query: string; matches: Array<{ path: string; line: number; preview: string }> }> {
+    const query = requireStringArg(args.query, "query");
+    const relativeDir = typeof args.path === "string" && args.path.trim().length > 0 ? args.path : ".";
+    const limit = normalizePositiveInteger(args.limit, 20);
+    const files = await this.collectFiles(this.resolveStoragePath(relativeDir), 500);
+    const loweredQuery = query.toLowerCase();
+    const matches: Array<{ path: string; line: number; preview: string }> = [];
+
+    for (const filePath of files) {
+      if (matches.length >= limit) {
+        break;
+      }
+
+      const relativePath = path.relative(this.config.dataPath, filePath);
+      if (relativePath.toLowerCase().includes(loweredQuery)) {
+        matches.push({ path: relativePath, line: 0, preview: relativePath });
+      }
+
+      if (matches.length >= limit) {
+        break;
+      }
+
+      let content: string;
+      try {
+        content = await readFile(filePath, "utf8");
+      } catch {
+        continue;
+      }
+
+      const lines = content.split(/\r?\n/);
+      for (let index = 0; index < lines.length; index += 1) {
+        if (!lines[index]!.toLowerCase().includes(loweredQuery)) {
+          continue;
+        }
+
+        matches.push({
+          path: relativePath,
+          line: index + 1,
+          preview: summarizeLine(lines[index]!),
+        });
+
+        if (matches.length >= limit) {
+          break;
+        }
+      }
+    }
+
+    return { query, matches };
+  }
+
+  private validateAiToolPath(relativePath: string, source: string, operation: "read" | "write"): void {
+    if (source !== "iteration") {
+      return;
+    }
+
+    if (relativePath === "memory.md" || relativePath === "tasks.json") {
+      throw new Error(`AI iteration tool must not ${operation} ${relativePath}; ${relativePath} is managed by the worker text flow`);
+    }
+  }
+
+  private async aiToolCreateTask(args: Record<string, unknown>): Promise<{ task: WorkerTask }> {
+    const title = requireStringArg(args.title, "title").trim();
+    if (!title) {
+      throw new Error("create_task requires a non-empty title");
+    }
+
+    const tasks = await this.readTaskList();
+    const task: WorkerTask = {
+      id: randomUUID(),
+      title,
+      status: "open",
+    };
+    tasks.push(task);
+    await this.writeTaskList(tasks);
+    await this.appendProgressLog("implementation:planning", `Created implementation task '${task.title}'`);
+    return { task };
+  }
+
+  private async aiToolUpdateTask(args: Record<string, unknown>): Promise<{ task: WorkerTask }> {
+    const id = requireStringArg(args.id, "id");
+    const status = requireTaskStatusArg(args.status, "status");
+    const title = typeof args.title === "string" ? args.title.trim() : undefined;
+    const tasks = await this.readTaskList();
+    const index = tasks.findIndex((task) => task.id === id);
+    if (index < 0) {
+      throw new Error(`update_task referenced unknown task id '${id}'`);
+    }
+
+    const nextTask: WorkerTask = {
+      ...tasks[index]!,
+      status,
+      ...(title ? { title } : {}),
+    };
+    tasks[index] = nextTask;
+    await this.writeTaskList(tasks);
+    await this.appendProgressLog("implementation:iterating", `Updated implementation task '${nextTask.title}' to ${nextTask.status}`);
+    return { task: nextTask };
+  }
+
+  private async aiToolListTasks(): Promise<{ tasks: WorkerTask[] }> {
+    return { tasks: await this.readTaskList() };
+  }
+
+  private async aiToolWebSearch(args: Record<string, unknown>): Promise<WorkerSearchResponse> {
+    const query = requireStringArg(args.query, "query");
+    return this.search({
+      type: "search",
+      query,
+      ...(typeof args.limit === "number" ? { limit: args.limit } : {}),
+      ...(typeof args.language === "string" ? { language: args.language } : {}),
+      ...(typeof args.region === "string" ? { region: args.region } : {}),
+      ...(typeof args.safeSearch === "string" ? { safeSearch: args.safeSearch as WorkerSearchRequest["safeSearch"] } : {}),
+      ...(typeof args.site === "string" ? { site: args.site } : {}),
+      ...(typeof args.freshness === "string" ? { freshness: args.freshness } : {}),
+    });
+  }
+
+  private async aiToolExecuteTypescript(args: Record<string, unknown>): Promise<{
+    ok: boolean;
+    outputFile: string;
+    stdout: string;
+    stderr: string;
+    returnValue?: unknown;
+    error?: {
+      message: string;
+      stack?: string;
+    };
+  }> {
+    const script = requireStringArg(args.script, "script");
+    const outputFile = path.join("tmp", `execute-typescript-${Date.now()}-${randomUUID()}.mjs`);
+    const outputPath = this.resolveStoragePath(outputFile);
+    const transpiled = ts.transpileModule(script, {
+      compilerOptions: {
+        module: ts.ModuleKind.ESNext,
+        target: ts.ScriptTarget.ES2022,
+      },
+      fileName: "execute-typescript.ts",
+    });
+
+    await mkdir(path.dirname(outputPath), { recursive: true });
+    await writeFile(outputPath, transpiled.outputText, "utf8");
+    await this.appendProgressLog("implementation:iterating", "AI tool compiled execute_typescript script");
+
+    const stdoutChunks: string[] = [];
+    const stderrChunks: string[] = [];
+    const moduleUrl = `${pathToFileURL(outputPath).href}?t=${Date.now()}`;
+    const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+    const originalStderrWrite = process.stderr.write.bind(process.stderr);
+
+    const captureWrite = (chunks: string[], originalWrite: typeof process.stdout.write) => {
+      return ((chunk: string | Uint8Array, encoding?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => {
+        const resolvedEncoding = typeof encoding === "string" ? encoding : undefined;
+        const resolvedCallback = typeof encoding === "function" ? encoding : callback;
+        chunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString(resolvedEncoding ?? "utf8"));
+        return originalWrite(chunk as never, encoding as never, resolvedCallback as never);
+      }) as typeof process.stdout.write;
+    };
+
+    process.stdout.write = captureWrite(stdoutChunks, originalStdoutWrite);
+    process.stderr.write = captureWrite(stderrChunks, originalStderrWrite);
+
+    let result: {
+      ok: boolean;
+      outputFile: string;
+      stdout: string;
+      stderr: string;
+      returnValue?: unknown;
+      error?: {
+        message: string;
+        stack?: string;
+      };
+    };
+
+    try {
+      const imported = await import(moduleUrl);
+      const executor = typeof imported.default === "function"
+        ? imported.default
+        : typeof imported.run === "function"
+          ? imported.run
+          : undefined;
+
+      const returnValue = executor
+        ? await executor(this.createExecuteTypescriptContext())
+        : undefined;
+
+      result = {
+        ok: true,
+        outputFile,
+        stdout: stdoutChunks.join(""),
+        stderr: stderrChunks.join(""),
+        ...(returnValue === undefined ? {} : { returnValue }),
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      result = {
+        ok: false,
+        outputFile,
+        stdout: stdoutChunks.join(""),
+        stderr: stderrChunks.join(""),
+        error: error instanceof Error
+          ? { message, ...(error.stack ? { stack: error.stack } : {}) }
+          : { message },
+      };
+      await this.appendProgressLog("implementation:iterating", `AI tool execute_typescript failed: ${message}`);
+    } finally {
+      process.stdout.write = originalStdoutWrite;
+      process.stderr.write = originalStderrWrite;
+    }
+
+    await this.appendProgressLog("implementation:iterating", "AI tool finished execute_typescript script");
+    return result;
+  }
+
+  private createExecuteTypescriptContext(): {
+    storagePath: string;
+    resolvePath: (relativePath: string) => string;
+    readTextFile: (relativePath: string) => Promise<string>;
+    writeTextFile: (relativePath: string, content: string) => Promise<void>;
+    appendTextFile: (relativePath: string, content: string) => Promise<void>;
+    exec: (
+      command: string,
+      options?: {
+        cwd?: string;
+        env?: Record<string, string>;
+      },
+    ) => Promise<{ stdout: string; stderr: string }>;
+  } {
+    return {
+      storagePath: this.config.dataPath,
+      resolvePath: (relativePath) => this.resolveStoragePath(relativePath),
+      readTextFile: async (relativePath) => readFile(this.resolveStoragePath(relativePath), "utf8"),
+      writeTextFile: async (relativePath, content) => {
+        const fullPath = this.resolveStoragePath(relativePath);
+        await mkdir(path.dirname(fullPath), { recursive: true });
+        await writeFile(fullPath, content, "utf8");
+      },
+      appendTextFile: async (relativePath, content) => {
+        const fullPath = this.resolveStoragePath(relativePath);
+        await mkdir(path.dirname(fullPath), { recursive: true });
+        await appendFile(fullPath, content, "utf8");
+      },
+      exec: async (command, options) => {
+        const cwd = options?.cwd ? path.resolve(this.config.dataPath, options.cwd) : this.config.dataPath;
+        const { stdout, stderr } = await exec(command, {
+          cwd,
+          env: {
+            ...process.env,
+            ...options?.env,
+          },
+          maxBuffer: 10 * 1024 * 1024,
+        });
+
+        return { stdout, stderr };
+      },
+    };
+  }
+
+  private async collectFiles(rootPath: string, limit: number): Promise<string[]> {
+    const results: string[] = [];
+    const visit = async (currentPath: string): Promise<void> => {
+      if (results.length >= limit) {
+        return;
+      }
+
+      const entries = await readdir(currentPath, { withFileTypes: true });
+      for (const entry of entries) {
+        if (results.length >= limit) {
+          return;
+        }
+
+        const fullPath = path.join(currentPath, entry.name);
+        if (entry.isDirectory()) {
+          if (path.relative(this.config.dataPath, fullPath).startsWith("tmp")) {
+            continue;
+          }
+          await visit(fullPath);
+          continue;
+        }
+
+        if (entry.isFile()) {
+          results.push(fullPath);
+        }
+      }
+    };
+
+    await visit(rootPath);
+    return results;
   }
 
   private async prepareStorage(): Promise<void> {
@@ -270,12 +870,22 @@ export class TaskWorkerService {
     }
   }
 
-  private async readTodoFile(): Promise<string> {
+  private async readTaskList(): Promise<WorkerTask[]> {
     try {
-      return await readFile(this.resolveStoragePath("todo.md"), "utf8");
+      const raw = await readFile(this.resolveStoragePath("tasks.json"), "utf8");
+      return parseTaskList(raw);
     } catch {
-      return "";
+      return [];
     }
+  }
+
+  private async writeTaskList(tasks: WorkerTask[]): Promise<void> {
+    await writeFile(this.resolveStoragePath("tasks.json"), JSON.stringify({ tasks }, null, 2), "utf8");
+  }
+
+  private async clearTaskList(reason: string, phase: RuntimeModePhase = "implementation:planning"): Promise<void> {
+    await this.writeTaskList([]);
+    await this.appendProgressLog(phase, reason);
   }
 
   private async readProgressLog(): Promise<string> {
@@ -287,10 +897,10 @@ export class TaskWorkerService {
   }
 
   private async buildPromptContext(task: string, workingContext: IterationContextEntry[]): Promise<PromptContext> {
-    const [memory, existingAppSource, todo, progressLog, contextLog] = await Promise.all([
+    const [memory, existingAppSource, tasks, progressLog, contextLog] = await Promise.all([
       this.readMemoryFile(),
       this.readExistingAppSource(),
-      this.readTodoFile(),
+      this.readTaskList(),
       this.readProgressLog(),
       this.readContextLog(),
     ]);
@@ -299,87 +909,70 @@ export class TaskWorkerService {
       task,
       memory,
       existingAppSource,
-      todo,
+      tasks,
       workingContext,
       progressLog,
       contextLog,
     };
   }
 
-  private async askAiToPlanTodo(context: PromptContext, error?: string): Promise<string> {
-    await this.appendProgressLog("ai", "Requesting todo planning over the message bus");
-
-    const response = await this.askAi(JSON.stringify({
-      type: "completion",
-      system: [
-        "You plan implementation work for task.md and return only todo.md content.",
-        "todo.md is only for the implementation work needed to solve task.md.",
-        "First think through what must be implemented, including checking whether the existing app already solves the task and which patches or improvements are needed if it does not.",
-        "Return only todo.md content in this exact format: first line '# TODO', followed by checkbox lines '- [ ] ...' or '- [x] ...'.",
-        "Do not return app/index.ts, explanations, markdown fences, or any other file.",
-        "If this is a retry after failure, create a fresh implementation checklist for the new attempt based on the failure context.",
-      ].join(" "),
-      messages: [
-        {
-          role: "user",
-          content: JSON.stringify({
-            goal: error
-              ? "Create a fresh implementation todo list for the next retry"
-              : "Create the implementation todo list for the current task",
-            task: context.task,
-            memory: context.memory,
-            existingAppSource: context.existingAppSource,
-            currentTodo: context.todo,
-            workingContext: context.workingContext,
-            progress: context.progressLog,
-            contextLog: context.contextLog,
-            failure: error,
-            requiredResponse: {
-              file: "todo.md",
-              format: "# TODO followed by checkbox items",
-            },
-          }, null, 2),
-        },
-      ],
-    }));
-
-    await this.appendProgressLog("implementation:planning", `Received AI todo planning response via ${response.s}`);
-    await this.logAiTools(response.m, "todo-planning");
-    return selectTodoContent(response.m);
-  }
-
   private async askAiForIteration(context: PromptContext): Promise<unknown> {
     await this.appendProgressLog("ai", "Requesting iterative app update over the message bus");
+    const appFileExists = context.existingAppSource.trim().length > 0;
+    const availableFiles = appFileExists
+      ? ["task.md", "app/index.ts", "logs/progress.log", "logs/context.log"]
+      : ["task.md", "logs/progress.log", "logs/context.log"];
+    const implementationTools = this.createImplementationTools();
+    const availableToolNames = implementationTools.map((tool) => tool.name as WorkerAiToolName);
+    const hasWebSearchTool = availableToolNames.includes("web_search");
+    const hasExecuteTypescriptTool = availableToolNames.includes("execute_typescript");
 
-    const response = await this.askAi(JSON.stringify({
-      type: "completion",
+    const response = await this.runAiWithWorkerTools({
+      type: "tool_use",
       system: [
         "You iteratively extend the existing TypeScript source code for app/index.ts.",
-        "Prefer updating the existing app instead of replacing it from scratch.",
-        "todo.md is only for the implementation work needed to solve task.md.",
+        "Prefer updating the existing app instead of replacing it from scratch when it already exists.",
         "At the start of each implementation run, think through what work is needed to solve the task, including analyzing the existing implementation and deciding which patches or improvements are needed.",
         "Before changing code, first consider whether the existing app already solves the task.",
-        "If it does not, create or update todo.md as the implementation checklist for solving task.md.",
+        "Use the worker task tool as the only source of implementation work tracking.",
+        "At the beginning of a fresh implementation run, create the implementation tasks you need with create_task.",
+        "app/index.ts may be missing at the start of a fresh run.",
+        "If app/index.ts is missing, treat that as normal and create it with write_file when you are ready to implement.",
+        "Do not assume read_file(app/index.ts) will succeed on a fresh run.",
         "You may solve the problem in multiple implementation steps.",
-        "Each iteration must perform a real implementation step, not just restate the task, memory, or todo.md.",
+        "Each iteration must perform a real implementation step, not just restate the task, memory, or the task list.",
         "A real implementation step may be code work in app/index.ts or non-code implementation work such as inspecting an existing file, tracing behavior, or refining the plan when that work is required to solve the task.",
-        "If an iteration does not change app/index.ts, the progress must still be visible in todo.md and in the iteration summary or notes.",
-        "Do not leave app/index.ts and todo.md effectively unchanged across iterations.",
-        "When work remains, make progress by completing one or more open todo items, or by replacing an open item with smaller concrete implementation tasks caused by what you just learned.",
-        "It is valid to complete multiple todo items in a single iteration when the work was actually done.",
-        "todo.md is required for every iteration and must use exactly this format: first line '# TODO', followed by checkbox lines '- [ ] ...' or '- [x] ...'.",
-        "After each implementation step, review todo.md, decide whether the checklist is complete, and add newly discovered implementation tasks when needed.",
-        "Only choose `test` after the implementation checklist is fully completed.",
+        "If an iteration does not change app/index.ts, the progress must still be visible in the worker-managed task list and in the iteration summary or notes.",
+        "Do not leave app/index.ts and the task list effectively unchanged across iterations.",
+        "When work remains, make progress by completing one or more open tasks, or by replacing an open task with smaller concrete implementation tasks caused by what you just learned.",
+        "It is valid to complete multiple tasks in a single iteration when the work was actually done.",
+        "Review list_tasks() after each implementation step, keep the task list current, and add newly discovered implementation tasks when needed.",
+        "Only choose `test` after list_tasks() shows no open tasks.",
         "The file must export `default async function run(host)`.",
         "The app must provide a local HTTP REST API.",
+        [
+          "Use the provided tools for file reads, file writes, task tracking, and content search during implementation.",
+          hasExecuteTypescriptTool ? "Use execute_typescript when direct TypeScript execution is the best fit." : "",
+        ].filter(Boolean).join(" "),
+        ...(hasExecuteTypescriptTool
+          ? [
+            "Use execute_typescript whenever a step is easier or more reliable to perform by running TypeScript directly, including shell commands, npm installs, scaffolding, filesystem transforms, or analysis scripts.",
+            "execute_typescript has full Node.js access and may use child_process, filesystem APIs, and any other built-in modules.",
+          ]
+          : []),
+        "Do not use tools to read or write tasks.json or memory.md; those are managed by the worker.",
+        "Read relevant files before changing them. Persist implementation changes to app/index.ts via write_file.",
         "You may decide to continue editing without testing, or to stop editing and let the worker test the app.",
         "Return an explicit decision of `continue` or `test`.",
         "Return only one fenced ```ts code block for app/index.ts when you provide source code.",
-        "Use `host.search(...)` when web lookup is required.",
+        ...(hasWebSearchTool
+          ? ["Use the web_search tool when external lookup is required. Generated app code must use host.search(...) for runtime web lookups."]
+          : []),
         "Do not call AI, do not request more inference, and do not use host.askAi.",
         "Do not perform direct network requests; use only host methods.",
         "Use only the host methods described in the request.",
       ].join(" "),
+      toolChoice: "auto",
       messages: [
         {
           role: "user",
@@ -388,16 +981,17 @@ export class TaskWorkerService {
             task: context.task,
             memory: context.memory,
             existingAppSource: context.existingAppSource,
-            todo: context.todo,
+            appFileExists,
+            currentTasks: context.tasks,
             workingContext: context.workingContext,
             progress: context.progressLog,
             contextLog: context.contextLog,
+            availableFiles,
             requiredResponse: {
               decision: "continue | test",
               summary: "short summary of the change for the worker context",
               notes: "optional additional notes",
-              todoFile: "todo.md in required checklist format",
-              todoRule: "todo.md must only describe implementation work for solving task.md; after each completed step review it and expand it if more implementation work is needed; choose test only when all items are done",
+              taskRule: "Implementation work must be tracked exclusively through create_task, update_task, and list_tasks; choose test only when all tasks are done",
               file: "app/index.ts",
               export: "default async function run(host)",
             },
@@ -413,25 +1007,26 @@ export class TaskWorkerService {
                 "completeTask",
                 "failTask",
               ],
+              taskTools: [
+                "create_task",
+                "update_task",
+                "list_tasks",
+              ],
+              executionTools: hasExecuteTypescriptTool ? ["execute_typescript(script)"] : [],
+              optionalLookupTools: hasWebSearchTool ? ["web_search(query)"] : [],
             },
           }, null, 2),
         },
       ],
-    }));
+      tools: implementationTools,
+    }, "iteration");
 
-    await this.appendProgressLog("implementation:iterating", `Received AI iteration response via ${response.s}`);
-    await this.logAiTools(response.m, "iteration");
-    return response.m;
+    return response;
   }
 
   private async writeAppSource(source: string): Promise<void> {
     await writeFile(this.resolveStoragePath("app/index.ts"), source, "utf8");
     await this.appendProgressLog("implementation:iterating", "Wrote generated app/index.ts");
-  }
-
-  private async writeTodoFile(content: string): Promise<void> {
-    await writeFile(this.resolveStoragePath("todo.md"), content, "utf8");
-    await this.appendProgressLog("implementation:planning", "Wrote generated todo.md");
   }
 
   private async appendIterationContext(entry: IterationContextEntry): Promise<void> {
@@ -442,7 +1037,7 @@ export class TaskWorkerService {
       decision: entry.decision,
       summary: entry.summary,
       notes: entry.notes,
-      todo: entry.todo,
+      tasks: entry.tasks,
       updatedFiles: entry.updatedFiles,
     });
     await appendFile(this.resolveStoragePath("logs/context.log"), `${record}\n`, "utf8");
@@ -451,11 +1046,6 @@ export class TaskWorkerService {
   private async clearWorkingContext(reason = "Cleared implementation working context"): Promise<void> {
     await writeFile(this.resolveStoragePath("logs/context.log"), "", "utf8");
     await this.appendProgressLog("test", reason);
-  }
-
-  private async clearTodoFile(reason: string, phase: RuntimeModePhase = "implementation:planning"): Promise<void> {
-    await rm(this.resolveStoragePath("todo.md"), { force: true });
-    await this.appendProgressLog(phase, reason);
   }
 
   private async synthesizeMemoryFromFailure(
@@ -469,6 +1059,7 @@ export class TaskWorkerService {
       type: "completion",
       system: [
         "You prepare memory.md for the next worker attempt after a failed run.",
+        "Memory is managed directly by the worker, so do not request tools for memory.md.",
         "Return only the memory.md content as plain text.",
         "You are given the existing memory.md and must carry forward any findings from it that still matter.",
         "Merge the old memory with the new failure context so relevant findings are not lost.",
@@ -492,8 +1083,7 @@ export class TaskWorkerService {
     }));
 
     await this.logAiTools(response.m, "memory");
-
-    const memory = extractMemoryContent(response.m);
+    const memory = extractMemoryContent(response.m) || await this.readMemoryFile();
     if (!memory) {
       throw new Error("Memory synthesis returned no usable content");
     }
@@ -506,13 +1096,24 @@ export class TaskWorkerService {
     let attempt = 0;
     let iteration = 0;
     let lastErrorMessage: string | undefined;
+    const workingContext: IterationContextEntry[] = [];
+
+    await writeFile(this.resolveStoragePath("logs/context.log"), "", "utf8");
 
     while (true) {
       attempt += 1;
       this.#completion = null;
 
-      const failure = await this.runImplementationAttempt(task, requestId, attempt, iteration, lastErrorMessage);
+      const failure = await this.runImplementationAttempt(
+        task,
+        requestId,
+        attempt,
+        iteration,
+        workingContext,
+        lastErrorMessage,
+      );
       if (!failure) {
+        await this.clearWorkingContext("Cleared implementation working context after completed run");
         const completion = this.requireCompletion();
         return completion;
       }
@@ -529,22 +1130,19 @@ export class TaskWorkerService {
     requestId: string,
     attempt: number,
     startingIteration: number,
+    workingContext: IterationContextEntry[],
     lastErrorMessage?: string,
   ): Promise<FailedAttemptSnapshot | null> {
     let iteration = startingIteration;
-    const workingContext: IterationContextEntry[] = [];
 
     try {
-      const planningContext = await this.buildPromptContext(task, []);
-      const plannedTodo = await this.askAiToPlanTodo(planningContext, lastErrorMessage);
-      this.validateTodoContent(plannedTodo);
-      await this.writeTodoFile(plannedTodo);
+      await this.clearTaskList("Reset tasks.json before starting implementation planning", "implementation:planning");
       await this.emitProgress({
         requestId,
         worker: this.runtime.serviceName,
         phase: "implementation:planning",
-        message: "planned implementation todo.md for the current run.",
-        updatedFiles: ["todo.md", this.relativeStoragePath("logs/progress.log")],
+        message: "starting implementation planning with worker-managed tasks.",
+        updatedFiles: ["tasks.json", this.relativeStoragePath("logs/progress.log")],
         done: false,
         state: "running",
       });
@@ -553,23 +1151,28 @@ export class TaskWorkerService {
         iteration += 1;
         const promptContext = await this.buildPromptContext(task, workingContext);
         const aiPayload = await this.askAiForIteration(promptContext);
+        const latestAppSource = await this.readExistingAppSource();
+        let latestTasks = await this.readTaskList();
+        const payloadTasks = selectTaskListContent(aiPayload);
+        if (payloadTasks.length > 0) {
+          latestTasks = payloadTasks;
+          await this.writeTaskList(latestTasks);
+        }
 
         const instruction = this.selectIterationInstruction(
           task,
-          promptContext.existingAppSource,
-          promptContext.todo,
+          latestAppSource || promptContext.existingAppSource,
           aiPayload,
         );
         this.validateGeneratedAppSource(instruction.appSource);
-        this.validateTodoContent(instruction.todo);
-        const normalizedInstruction = await this.normalizeIterationDecisionAgainstTodo(instruction);
-        this.validateIterationProgress(promptContext, normalizedInstruction);
+        this.validateTaskList(latestTasks);
+        const normalizedInstruction = await this.normalizeIterationDecisionAgainstTasks(instruction, latestTasks);
+        this.validateIterationProgress(promptContext, normalizedInstruction, latestTasks);
         await this.writeAppSource(normalizedInstruction.appSource);
-        await this.writeTodoFile(normalizedInstruction.todo);
 
         const updatedFiles = [
           "app/index.ts",
-          "todo.md",
+          "tasks.json",
           this.relativeStoragePath("logs/context.log"),
           this.relativeStoragePath("logs/progress.log"),
         ];
@@ -578,7 +1181,7 @@ export class TaskWorkerService {
           decision: normalizedInstruction.decision,
           summary: normalizedInstruction.summary,
           notes: normalizedInstruction.notes,
-          todo: normalizedInstruction.todo,
+          tasks: latestTasks,
           appSource: normalizedInstruction.appSource,
           updatedFiles,
         };
@@ -595,7 +1198,7 @@ export class TaskWorkerService {
         });
 
         if (normalizedInstruction.decision === "continue") {
-          await this.appendProgressLog("implementation:iterating", `Continuing iterative edit loop after iteration ${iteration} after reviewing todo.md`);
+          await this.appendProgressLog("implementation:iterating", `Continuing iterative edit loop after iteration ${iteration} after reviewing tasks.json`);
           continue;
         }
 
@@ -608,7 +1211,7 @@ export class TaskWorkerService {
         throw new Error(completion.summary);
       }
 
-      this.#completion = await this.verifyCompletion(task, completion, []);
+      this.#completion = await this.verifyCompletion(task, completion, workingContext);
       return null;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Worker execution failed";
@@ -620,19 +1223,18 @@ export class TaskWorkerService {
         error: message,
         workingContext,
         appSource: promptContext.existingAppSource,
-        todo: promptContext.todo,
+        tasks: promptContext.tasks,
       };
     }
   }
 
   private async runTestMode(task: string, requestId: string): Promise<void> {
-    await this.clearWorkingContext("Cleared implementation working context before test");
     await this.appendProgressLog("test", "Starting fresh test run for app/index.ts");
     await this.evaluateApp(
       "app/index.ts",
       "test",
-      "implementation checklist is complete. start fresh test run.",
-      ["app/index.ts", "todo.md"],
+      "all tracked implementation tasks are complete. start fresh test run.",
+      ["app/index.ts", "tasks.json"],
     );
     await this.appendProgressLog("test", `Finished app execution for task '${task.slice(0, 80)}'`);
     await this.emitProgress({
@@ -640,7 +1242,7 @@ export class TaskWorkerService {
       worker: this.runtime.serviceName,
       phase: "test",
       message: "app execution finished. verifying task result.",
-      updatedFiles: ["app/index.ts", "todo.md", this.relativeStoragePath("logs/progress.log")],
+      updatedFiles: ["app/index.ts", "tasks.json", this.relativeStoragePath("logs/progress.log")],
       done: false,
       state: "running",
     });
@@ -653,7 +1255,7 @@ export class TaskWorkerService {
       worker: this.runtime.serviceName,
       phase: "experience",
       message: `attempt ${failure.attempt} failed: ${failure.error}. synthesizing memory for the next implementation plan.`,
-      updatedFiles: ["app/index.ts", "todo.md", this.relativeStoragePath("logs/context.log"), this.relativeStoragePath("logs/progress.log")],
+      updatedFiles: ["app/index.ts", "tasks.json", this.relativeStoragePath("logs/context.log"), this.relativeStoragePath("logs/progress.log")],
       done: false,
       state: "running",
     });
@@ -661,8 +1263,10 @@ export class TaskWorkerService {
     try {
       const promptContext = await this.buildPromptContext(task, failure.workingContext);
       await this.synthesizeMemoryFromFailure(promptContext, failure.appSource, failure.error);
-      await this.clearTodoFile(
-        "Cleared todo.md after failed attempt so the next implementation planning phase can start fresh",
+      failure.workingContext.length = 0;
+      await this.clearWorkingContext("Cleared implementation working context after memorizing failed attempt");
+      await this.clearTaskList(
+        "Cleared tasks.json after failed attempt so the next implementation planning phase can start fresh",
         "experience",
       );
     } catch (memoryError) {
@@ -787,14 +1391,16 @@ export class TaskWorkerService {
     workingContext: IterationContextEntry[],
   ): Promise<WorkerRunResult> {
     await this.appendProgressLog("test", "Requesting AI result verification");
+    const appSource = await this.readExistingAppSource();
     const resultContent = completion.resultFile
       ? await readFile(this.resolveStoragePath(completion.resultFile), "utf8").catch(() => "")
-      : "";
+      : completion.summary;
 
     const response = await this.askAi(JSON.stringify({
       type: "completion",
       system: [
         "You verify whether a generated task result appears to satisfy the task.",
+        "Use the app source and completion summary when no result file content is available, such as for long-running services that only signal readiness.",
         "Return a verdict of VALID or INVALID plus a short reason.",
       ].join(" "),
       messages: [
@@ -803,6 +1409,7 @@ export class TaskWorkerService {
           content: JSON.stringify({
             task,
             workingContext,
+            appSource,
             summary: completion.summary,
             resultFile: completion.resultFile,
             resultContent,
@@ -830,14 +1437,33 @@ export class TaskWorkerService {
   }
 
   private async search(request: string | WorkerSearchRequest): Promise<WorkerSearchResponse> {
+    const normalizedRequest = normalizeSearchRequest(request);
     const target = this.config.searchTarget ?? (await this.discoverTarget(this.config.searchKind ?? "search", "search"));
     const response = await this.requestToolMessage(
       target,
-      normalizeSearchRequest(request),
+      normalizedRequest,
       "Timed out waiting for search response",
     );
 
-    return normalizeSearchResponse(response.m);
+    if (response.c === "error") {
+      const failure = normalizeSearchFailure(response.m);
+      await this.appendProgressLog(
+        "search",
+        `Search returned no usable results for ${JSON.stringify(normalizedRequest.query ?? "")}: ${failure.reason}`,
+      );
+      return createEmptySearchResponse(response.i, target, normalizedRequest, failure);
+    }
+
+    try {
+      return normalizeSearchResponse(response.m);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "Search returned an invalid response payload";
+      await this.appendProgressLog(
+        "search",
+        `Search response could not be normalized for ${JSON.stringify(normalizedRequest.query ?? "")}: ${reason}`,
+      );
+      return createEmptySearchResponse(response.i, target, normalizedRequest, { reason });
+    }
   }
 
   private async discoverTarget(kind: string, label: string): Promise<string> {
@@ -957,8 +1583,8 @@ export class TaskWorkerService {
       throw new Error("Generated app must not call host.askAi");
     }
 
-    if (/^\s*# TODO\b/m.test(source) || /^\s*- \[(?: |x)\] /m.test(source)) {
-      throw new Error("Generated app source looks like todo.md content instead of TypeScript");
+    if (/^\s*\{\s*"tasks"\s*:/m.test(source)) {
+      throw new Error("Generated app source looks like tasks.json content instead of TypeScript");
     }
   }
 
@@ -973,20 +1599,17 @@ export class TaskWorkerService {
   private selectIterationInstruction(
     task: string,
     fallbackAppSource: string,
-    fallbackTodo: string,
     aiPayload: unknown,
   ): IterationInstruction {
     const summary = extractIterationSummary(aiPayload) ?? "Updated app/index.ts";
     const notes = extractIterationNotes(aiPayload);
     const decision = extractIterationDecision(aiPayload) ?? "test";
     const appSource = selectAppSource(task, fallbackAppSource, aiPayload);
-    const todo = selectTodoContent(aiPayload) || fallbackTodo;
 
     return {
       decision,
       summary,
       notes,
-      todo,
       appSource,
     };
   }
@@ -1134,75 +1757,76 @@ export class TaskWorkerService {
         done: false,
         state: "running",
       });
-      await this.clearTodoFile("Cleared todo.md before starting a new implementation-planning run", "start");
+      await this.clearTaskList("Cleared tasks.json before starting a new implementation-planning run", "start");
       this.#completion = null;
       return null;
     }
   }
 
-  private validateTodoContent(content: string): void {
-    const trimmed = content.trim();
-
-    if (!trimmed) {
-      throw new Error("Generated todo.md is required");
+  private validateTaskList(tasks: WorkerTask[]): void {
+    if (tasks.length === 0) {
+      throw new Error("Generated task list is required");
     }
 
-    const lines = trimmed.split(/\r?\n/);
-    if (lines[0] !== "# TODO") {
-      throw new Error("Generated todo.md must start with '# TODO'");
-    }
-
-    const checklistLines = lines.slice(1).filter((line) => line.trim().length > 0);
-    if (checklistLines.length === 0) {
-      throw new Error("Generated todo.md must contain at least one checklist item");
-    }
-
-    for (const line of checklistLines) {
-      if (!/^- \[(?: |x)\] .+$/.test(line)) {
-        throw new Error("Generated todo.md contains invalid checklist formatting");
+    for (const task of tasks) {
+      if (!task.id.trim()) {
+        throw new Error("Generated task list contains a task without an id");
+      }
+      if (!task.title.trim()) {
+        throw new Error("Generated task list contains a task without a title");
+      }
+      if (task.status !== "open" && task.status !== "done") {
+        throw new Error("Generated task list contains an invalid task status");
       }
     }
   }
 
-  private async normalizeIterationDecisionAgainstTodo(instruction: IterationInstruction): Promise<IterationInstruction> {
-    if (instruction.decision === "test" && todoHasOpenItems(instruction.todo)) {
+  private async normalizeIterationDecisionAgainstTasks(
+    instruction: IterationInstruction,
+    tasks: WorkerTask[],
+  ): Promise<IterationInstruction> {
+    if (instruction.decision === "test" && taskListHasOpenItems(tasks)) {
       await this.appendProgressLog(
         "implementation:iterating",
-        "Generated todo.md still has open items, so the worker will keep iterating instead of starting test",
+        "Generated task list still has open items, so the worker will keep iterating instead of starting test",
       );
       return {
         ...instruction,
         decision: "continue",
         wasTestDeferred: true,
         notes: instruction.notes
-          ? `${instruction.notes}\nWorker override: testing was deferred because todo.md still has open items.`
-          : "Worker override: testing was deferred because todo.md still has open items.",
+          ? `${instruction.notes}\nWorker override: testing was deferred because open tasks remain in tasks.json.`
+          : "Worker override: testing was deferred because open tasks remain in tasks.json.",
       };
     }
 
     return instruction;
   }
 
-  private validateIterationProgress(previous: PromptContext, instruction: IterationInstruction): void {
+  private validateIterationProgress(
+    previous: PromptContext,
+    instruction: IterationInstruction,
+    tasks: WorkerTask[],
+  ): void {
     if (instruction.decision !== "continue") {
       return;
     }
 
     const appChanged = normalizeForProgressComparison(previous.existingAppSource) !== normalizeForProgressComparison(instruction.appSource);
-    const todoChanged = normalizeForProgressComparison(previous.todo) !== normalizeForProgressComparison(instruction.todo);
-    const previousTodoStats = getTodoStats(previous.todo);
-    const currentTodoStats = getTodoStats(instruction.todo);
+    const tasksChanged = normalizeTaskListForProgressComparison(previous.tasks) !== normalizeTaskListForProgressComparison(tasks);
+    const previousTaskStats = getTaskStats(previous.tasks);
+    const currentTaskStats = getTaskStats(tasks);
 
-    if (!appChanged && !todoChanged) {
-      throw new Error("Iteration made no implementation progress: app/index.ts and todo.md were unchanged");
+    if (!appChanged && !tasksChanged) {
+      throw new Error("Iteration made no implementation progress: app/index.ts and tasks.json were unchanged");
     }
 
-    if (currentTodoStats.completed < previousTodoStats.completed) {
-      throw new Error("Iteration regressed todo progress: fewer checklist items are completed than in the previous iteration");
+    if (currentTaskStats.completed < previousTaskStats.completed) {
+      throw new Error("Iteration regressed task progress: fewer tasks are completed than in the previous iteration");
     }
 
-    if (instruction.wasTestDeferred && currentTodoStats.completed === previousTodoStats.completed && !appChanged) {
-      throw new Error("Iteration made no checklist progress after test was deferred because todo.md still had open items");
+    if (instruction.wasTestDeferred && currentTaskStats.completed === previousTaskStats.completed && !appChanged) {
+      throw new Error("Iteration made no task progress after test was deferred because tasks.json still had open items");
     }
   }
 }
@@ -1235,6 +1859,48 @@ function normalizeSearchResponse(payload: unknown): WorkerSearchResponse {
   }
 
   return candidate as WorkerSearchResponse;
+}
+
+function normalizeSearchFailure(payload: unknown): { reason: string; code?: string } {
+  if (typeof payload !== "object" || payload === null) {
+    return { reason: "Unknown search module error" };
+  }
+
+  const candidate = payload as { reason?: unknown; code?: unknown };
+  return {
+    reason: typeof candidate.reason === "string" && candidate.reason.trim().length > 0
+      ? candidate.reason
+      : "Unknown search module error",
+    ...(typeof candidate.code === "string" && candidate.code.trim().length > 0 ? { code: candidate.code } : {}),
+  };
+}
+
+function createEmptySearchResponse(
+  requestId: string,
+  responder: string,
+  request: WorkerSearchRequest,
+  failure?: { reason: string; code?: string },
+): WorkerSearchResponse {
+  return {
+    requestId,
+    responder,
+    status: "ok",
+    type: "search",
+    query: request.query ?? "",
+    results: [],
+    sourcesTried: [],
+    sourcesSucceeded: [],
+    sourcesFailed: failure ? [{
+      source: responder,
+      reason: failure.reason,
+      ...(failure.code ? { code: failure.code } : {}),
+    }] : [],
+    dedupe: {
+      inputCount: 0,
+      uniqueCount: 0,
+      removedCount: 0,
+    },
+  };
 }
 
 function extractNamedFileContent(
@@ -1291,38 +1957,51 @@ function selectAppSource(task: string, fallbackAppSource: string, aiPayload: unk
   return createDefaultAppTemplate(task);
 }
 
-function selectTodoContent(aiPayload: unknown): string {
-  const todoFile = extractNamedFileContent(aiPayload, "todo.md");
-  if (todoFile) {
-    return todoFile;
+function selectTaskListContent(aiPayload: unknown): WorkerTask[] {
+  const taskFile = extractNamedFileContent(aiPayload, "tasks.json");
+  if (taskFile) {
+    return parseTaskList(taskFile);
   }
 
   if (typeof aiPayload !== "object" || aiPayload === null) {
-    return "";
+    return [];
   }
 
   const payload = aiPayload as {
-    todo?: unknown;
-    plan?: { todo?: unknown };
+    tasks?: unknown;
+    plan?: { tasks?: unknown };
     answer?: unknown;
     message?: { content?: unknown };
   };
 
-  if (typeof payload.todo === "string" && payload.todo.trim().length > 0) {
-    return payload.todo.trim();
+  const directTasks = tryNormalizeTaskArray(payload.tasks);
+  if (directTasks.length > 0) {
+    return directTasks;
   }
 
-  if (typeof payload.plan?.todo === "string" && payload.plan.todo.trim().length > 0) {
-    return payload.plan.todo.trim();
+  const plannedTasks = tryNormalizeTaskArray(payload.plan?.tasks);
+  if (plannedTasks.length > 0) {
+    return plannedTasks;
   }
 
-  const text = [
+  const texts = [
     typeof payload.answer === "string" ? payload.answer : undefined,
     typeof payload.message?.content === "string" ? payload.message.content : undefined,
-  ].filter((value): value is string => Boolean(value)).join("\n");
+  ].filter((value): value is string => Boolean(value));
 
-  const match = text.match(/(?:^|\n)# TODO\n(?:- \[(?: |x)\] .*(?:\n|$))+/);
-  return match?.[0]?.trim() ?? "";
+  for (const text of texts) {
+    const parsed = tryParseJson(text);
+    if (typeof parsed !== "object" || parsed === null) {
+      continue;
+    }
+
+    const tasks = tryNormalizeTaskArray((parsed as { tasks?: unknown }).tasks);
+    if (tasks.length > 0) {
+      return tasks;
+    }
+  }
+
+  return [];
 }
 
 function extractAppCodeBlock(text: string): string | undefined {
@@ -1351,7 +2030,7 @@ function extractAppCodeBlock(text: string): string | undefined {
 
 function looksLikeAppSource(content: string): boolean {
   const trimmed = content.trim();
-  if (!trimmed || looksLikeTodoContent(trimmed)) {
+  if (!trimmed || looksLikeTasksContent(trimmed)) {
     return false;
   }
 
@@ -1359,8 +2038,8 @@ function looksLikeAppSource(content: string): boolean {
     || /\bhost\.(?:readFile|writeFile|appendProgress|readTask|readMemory|writeMemory|search|completeTask|failTask)\s*\(/.test(trimmed);
 }
 
-function looksLikeTodoContent(content: string): boolean {
-  return /^\s*# TODO\b/m.test(content) || /^\s*- \[(?: |x)\] /m.test(content);
+function looksLikeTasksContent(content: string): boolean {
+  return /^\s*\{\s*"tasks"\s*:/m.test(content);
 }
 
 function isTypeScriptFence(language: string): boolean {
@@ -1389,6 +2068,82 @@ function extractToolCalls(payload: unknown): Array<{ name: string; arguments: st
       name: toolCall.name as string,
       arguments: toolCall.arguments as string,
     }));
+}
+
+function extractAssistantResponseMessage(payload: unknown): AiAssistantResponseMessage {
+  if (typeof payload === "object" && payload !== null) {
+    const candidate = payload as {
+      message?: {
+        role?: unknown;
+        content?: unknown;
+        refusal?: unknown;
+        toolCalls?: unknown;
+      };
+      answer?: unknown;
+      toolCalls?: unknown;
+    };
+
+    if (candidate.message && typeof candidate.message === "object") {
+      const toolCalls = normalizeAiToolCalls(candidate.message.toolCalls);
+      return {
+        role: "assistant",
+        ...(typeof candidate.message.content === "string" ? { content: candidate.message.content } : {}),
+        ...(typeof candidate.message.refusal === "string" ? { refusal: candidate.message.refusal } : {}),
+        ...(toolCalls.length > 0 ? { toolCalls } : {}),
+      };
+    }
+
+    const toolCalls = normalizeAiToolCalls(candidate.toolCalls);
+    return {
+      role: "assistant",
+      ...(typeof candidate.answer === "string" ? { content: candidate.answer } : {}),
+      ...(toolCalls.length > 0 ? { toolCalls } : {}),
+    };
+  }
+
+  return {
+    role: "assistant",
+    content: typeof payload === "string" ? payload : "",
+  };
+}
+
+function normalizeAiToolCalls(value: unknown): AiToolCallMessage[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter((toolCall) => (
+      typeof toolCall === "object"
+      && toolCall !== null
+      && (toolCall as { type?: unknown }).type === "function"
+      && typeof (toolCall as { id?: unknown }).id === "string"
+      && typeof (toolCall as { name?: unknown }).name === "string"
+      && typeof (toolCall as { arguments?: unknown }).arguments === "string"
+    ))
+    .map((toolCall) => ({
+      id: (toolCall as { id: string }).id,
+      type: "function",
+      name: (toolCall as { name: string }).name,
+      arguments: (toolCall as { arguments: string }).arguments,
+    }));
+}
+
+function requireStringArg(value: unknown, key: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`AI tool argument '${key}' must be a non-empty string`);
+  }
+
+  return value;
+}
+
+function normalizePositiveInteger(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+function summarizeLine(line: string): string {
+  const normalized = line.trim().replace(/\s+/g, " ");
+  return normalized.length > 160 ? `${normalized.slice(0, 157)}...` : normalized;
 }
 
 function extractIterationDecision(payload: unknown): "continue" | "test" | undefined {
@@ -1611,31 +2366,100 @@ function formatPlanningMessage(
   const summary = instruction.summary.trim();
 
   if (instruction.decision === "continue") {
-    return `planning next implementation step ${iteration}. updating app/index.ts and reviewing todo.md. ${summary}`;
+    return `planning next implementation step ${iteration}. updating app/index.ts and reviewing tasks.json. ${summary}`;
   }
 
-  return `planning final implementation step ${iteration}. updating app/index.ts and reviewing todo.md. deciding work is complete. start test. ${summary}`;
+  return `planning final implementation step ${iteration}. updating app/index.ts and reviewing tasks.json. deciding work is complete. start test. ${summary}`;
 }
 
-function todoHasOpenItems(todo: string): boolean {
-  return /^- \[ \] /m.test(todo);
+function taskListHasOpenItems(tasks: WorkerTask[]): boolean {
+  return tasks.some((task) => task.status === "open");
 }
 
 function normalizeForProgressComparison(content: string): string {
   return content.replace(/\r\n/g, "\n").trim();
 }
 
-function getTodoStats(todo: string): { completed: number; open: number } {
+function normalizeTaskListForProgressComparison(tasks: WorkerTask[]): string {
+  return JSON.stringify(tasks.map((task) => ({
+    id: task.id,
+    title: task.title,
+    status: task.status,
+  })));
+}
+
+function getTaskStats(tasks: WorkerTask[]): { completed: number; open: number } {
   let completed = 0;
   let open = 0;
 
-  for (const line of todo.split(/\r?\n/)) {
-    if (/^- \[x\] /.test(line)) {
+  for (const task of tasks) {
+    if (task.status === "done") {
       completed += 1;
-    } else if (/^- \[ \] /.test(line)) {
+    } else if (task.status === "open") {
       open += 1;
     }
   }
 
   return { completed, open };
+}
+
+function parseTaskList(raw: string): WorkerTask[] {
+  if (!raw.trim()) {
+    return [];
+  }
+
+  const parsed = JSON.parse(raw) as { tasks?: unknown };
+  if (!Array.isArray(parsed.tasks)) {
+    throw new Error("tasks.json must contain a top-level tasks array");
+  }
+
+  return parsed.tasks.map((task, index) => normalizeTaskRecord(task, index));
+}
+
+function tryNormalizeTaskArray(value: unknown): WorkerTask[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.map((task, index) => normalizeTaskRecord(task, index));
+}
+
+function normalizeTaskRecord(task: unknown, index: number): WorkerTask {
+  if (typeof task !== "object" || task === null) {
+    throw new Error(`tasks.json contains a non-object task at index ${index}`);
+  }
+
+  const candidate = task as Partial<WorkerTask>;
+  if (typeof candidate.id !== "string" || typeof candidate.title !== "string") {
+    throw new Error(`tasks.json contains an invalid task at index ${index}`);
+  }
+
+  return {
+    id: candidate.id,
+    title: candidate.title,
+    status: requireTaskStatusArg(candidate.status, "status"),
+  };
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return typeof error === "object"
+    && error !== null
+    && "code" in error
+    && (error as { code?: unknown }).code === "ENOENT";
+}
+
+function requireTaskStatusArg(value: unknown, name: string): WorkerTaskStatus {
+  if (value === "open" || value === "done") {
+    return value;
+  }
+
+  throw new Error(`${name} must be 'open' or 'done'`);
+}
+
+function tryParseJson(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
 }

@@ -78,6 +78,17 @@ export interface WorkerSearchResponse {
   raw?: Record<string, unknown>;
 }
 
+export type WorkerAiToolName =
+  | "list_files"
+  | "read_file"
+  | "write_file"
+  | "search_files"
+  | "create_task"
+  | "update_task"
+  | "list_tasks"
+  | "web_search"
+  | "execute_typescript";
+
 export interface WorkerContextConfig {
   dataPath: string;
   aiKind: string;
@@ -85,6 +96,7 @@ export interface WorkerContextConfig {
   searchKind?: string;
   searchTarget?: string;
   messageBusTimeoutMs?: number;
+  enabledTools?: Partial<Record<WorkerAiToolName, boolean>>;
 }
 
 export interface WorkerRunResult {

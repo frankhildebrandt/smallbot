@@ -25,7 +25,7 @@ const runtime = new ModuleRuntime({
   },
 });
 
-const service = new AiService(runtime, createProvider({ serviceName, env: process.env }), serviceName);
+const service = new AiService(runtime, createProvider({ serviceName, env: process.env }), serviceName, dataPath);
 
 await runtime.start(async (message) => {
   await service.onMessage(message);

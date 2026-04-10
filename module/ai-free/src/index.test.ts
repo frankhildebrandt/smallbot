@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import { ModuleRuntime, WireMessage } from "@smallbot/framework";
 
+import { AzureAIProvider } from "./providers/azureai.js";
 import { createProvider } from "./providers/factory.js";
 import { OpenAIProvider } from "./providers/openai.js";
+import { OpenRouterProvider } from "./providers/openrouter.js";
 import { parseAiInferenceRequest } from "./requests.js";
 import { AiService } from "./service.js";
 
@@ -103,6 +108,33 @@ test("createProvider supports OpenAI env aliases", () => {
   });
 
   assert.ok(provider instanceof OpenAIProvider);
+});
+
+test("createProvider supports AzureAI env aliases", () => {
+  const provider = createProvider({
+    serviceName: "ai:1",
+    env: {
+      PROVIDER: "azureai",
+      AZURE_AI_API_KEY: "key",
+      AZURE_AI_MODEL: "gpt-4.1-mini",
+      AZURE_AI_BASE_URL: "https://example.openai.azure.com/openai/v1",
+    } as NodeJS.ProcessEnv,
+  });
+
+  assert.ok(provider instanceof AzureAIProvider);
+});
+
+test("createProvider supports OpenRouter env configuration", () => {
+  const provider = createProvider({
+    serviceName: "ai:1",
+    env: {
+      PROVIDER: "openrouter",
+      OPENROUTER_API_KEY: "key",
+      OPENROUTER_MODEL: "openai/gpt-4.1-mini",
+    } as NodeJS.ProcessEnv,
+  });
+
+  assert.ok(provider instanceof OpenRouterProvider);
 });
 
 test("createProvider rejects unsupported providers", () => {
@@ -209,9 +241,100 @@ test("OpenAIProvider normalizes tool calls", async () => {
   assert.equal(response.message?.toolCalls?.[0]?.arguments, "{\"city\":\"Berlin\"}");
 });
 
+test("AzureAIProvider uses api-key header", async () => {
+  let headers: HeadersInit | undefined;
+  const provider = new AzureAIProvider({
+    apiKey: "azure-key",
+    model: "gpt-4.1-mini",
+    serviceName: "ai:1",
+    baseUrl: "https://example.openai.azure.com/openai/v1",
+    fetchImpl: async (_input, init) => {
+      headers = init?.headers;
+      return new Response(JSON.stringify({
+        model: "gpt-4.1-mini",
+        choices: [
+          {
+            message: {
+              content: "Azure response",
+            },
+          },
+        ],
+      }), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+    },
+  });
+
+  const response = await provider.complete("req-azure", {
+    type: "completion",
+    messages: [{ role: "user", content: "hello" }],
+  });
+
+  assert.equal(response.answer, "Azure response");
+  assert.deepEqual(headers, {
+    "Content-Type": "application/json",
+    "api-key": "azure-key",
+  });
+});
+
+test("OpenRouterProvider sets optional attribution headers", async () => {
+  let headers: HeadersInit | undefined;
+  let requestBody: Record<string, unknown> | undefined;
+
+  const provider = new OpenRouterProvider({
+    apiKey: "router-key",
+    model: "openai/gpt-4.1-mini",
+    serviceName: "ai:1",
+    siteUrl: "https://smallbot.example",
+    appName: "SmallBot",
+    fetchImpl: async (_input, init) => {
+      headers = init?.headers;
+      requestBody = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({
+        model: "openai/gpt-4.1-mini",
+        choices: [
+          {
+            message: {
+              content: "OpenRouter response",
+            },
+          },
+        ],
+      }), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+    },
+  });
+
+  const response = await provider.complete("req-openrouter", {
+    type: "completion",
+    messages: [{ role: "user", content: "hello" }],
+  });
+
+  assert.equal(response.answer, "OpenRouter response");
+  assert.equal(requestBody?.model, "openai/gpt-4.1-mini");
+  assert.deepEqual(headers, {
+    "Content-Type": "application/json",
+    Authorization: "Bearer router-key",
+    "HTTP-Referer": "https://smallbot.example",
+    "X-Title": "SmallBot",
+  });
+});
+
 test("AiService returns results for typed requests", async () => {
+  const dataPath = await mkdtemp(path.join(os.tmpdir(), "smallbot-ai-"));
+  try {
   const runtime = new RuntimeStub() as unknown as ModuleRuntime;
-  const service = new AiService(runtime, new ProviderStub({ answer: "done", message: { role: "assistant", content: "done" } }), "ai:1");
+  const service = new AiService(runtime, new ProviderStub({
+    answer: "done",
+    message: { role: "assistant", content: "done" },
+    usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+  }), "ai:1", dataPath);
 
   await service.onMessage({
     s: "worker:1",
@@ -228,11 +351,18 @@ test("AiService returns results for typed requests", async () => {
   assert.deepEqual(typedRuntime.states, ["busy", "free"]);
   assert.equal(typedRuntime.sent[0]?.c, "result");
   assert.equal((typedRuntime.sent[0]?.m as { answer?: string }).answer, "done");
+  assert.match(await readFile(path.join(dataPath, "logs", "usage.log"), "utf8"), /request=req-1/);
+  assert.match(await readFile(path.join(dataPath, "logs", "usage.log"), "utf8"), /total_tokens=15/);
+  } finally {
+    await rm(dataPath, { recursive: true, force: true });
+  }
 });
 
 test("AiService keeps legacy payloads working", async () => {
+  const dataPath = await mkdtemp(path.join(os.tmpdir(), "smallbot-ai-"));
+  try {
   const runtime = new RuntimeStub() as unknown as ModuleRuntime;
-  const service = new AiService(runtime, new ProviderStub({ answer: "legacy", message: { role: "assistant", content: "legacy" } }), "ai:1");
+  const service = new AiService(runtime, new ProviderStub({ answer: "legacy", message: { role: "assistant", content: "legacy" } }), "ai:1", dataPath);
 
   await service.onMessage({
     s: "worker:1",
@@ -246,4 +376,47 @@ test("AiService keeps legacy payloads working", async () => {
 
   const typedRuntime = runtime as unknown as RuntimeStub;
   assert.equal(typedRuntime.sent[0]?.c, "result");
+  } finally {
+    await rm(dataPath, { recursive: true, force: true });
+  }
+});
+
+test("AiService logs inference errors to stderr and file", async () => {
+  const dataPath = await mkdtemp(path.join(os.tmpdir(), "smallbot-ai-"));
+  const runtime = new RuntimeStub() as unknown as ModuleRuntime;
+  const provider = {
+    name: "openrouter",
+    async complete(): Promise<never> {
+      throw new Error("provider exploded");
+    },
+  };
+
+  const originalConsoleError = console.error;
+  const stderrLines: unknown[][] = [];
+  console.error = (...args: unknown[]) => {
+    stderrLines.push(args);
+  };
+
+  try {
+    const service = new AiService(runtime, provider, "ai:1", dataPath);
+    await service.onMessage({
+      s: "worker:1",
+      t: "ai:1",
+      c: "tool",
+      i: "req-error",
+      m: {
+        prompt: "fail please",
+      },
+    });
+
+    const typedRuntime = runtime as unknown as RuntimeStub;
+    assert.equal(typedRuntime.sent[0]?.c, "error");
+    assert.match(String(stderrLines[0]?.[0] ?? ""), /request=req-error/);
+    assert.match(String(stderrLines[0]?.[0] ?? ""), /provider=openrouter/);
+    assert.match(await readFile(path.join(dataPath, "logs", "error.log"), "utf8"), /provider=openrouter/);
+    assert.match(await readFile(path.join(dataPath, "logs", "error.log"), "utf8"), /provider exploded/);
+  } finally {
+    console.error = originalConsoleError;
+    await rm(dataPath, { recursive: true, force: true });
+  }
 });
