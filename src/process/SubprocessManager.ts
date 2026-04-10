@@ -12,6 +12,9 @@ export interface ManagedModuleConfig {
   entryScript: string;
   capabilities?: string[];
   env?: Record<string, string>;
+  permissions: {
+    networking: boolean;
+  };
 }
 
 interface ManagedChild {
@@ -47,14 +50,7 @@ export class SubprocessManager {
 
     await Promise.all(
       Array.from(this.#children.values()).map(async ({ process: child, config }) => {
-        if (!child.killed) {
-          child.kill("SIGTERM");
-        }
-
-        await new Promise<void>((resolve) => {
-          child.once("exit", () => resolve());
-          setTimeout(resolve, 2_000).unref();
-        });
+        await stopChildProcess(child);
 
         this.broker.updateServiceState(config.name, "stopped");
       }),
@@ -90,6 +86,7 @@ export class SubprocessManager {
         SERVICE_KIND: config.kind,
         ...config.env,
       },
+      permissions: config.permissions,
       mode: this.sandboxMode,
     });
 
@@ -107,4 +104,42 @@ export class SubprocessManager {
       config,
     });
   }
+}
+
+async function stopChildProcess(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+
+  child.kill("SIGTERM");
+
+  const exitedGracefully = await waitForExit(child, 2_000);
+
+  if (exitedGracefully) {
+    return;
+  }
+
+  child.kill("SIGKILL");
+  await waitForExit(child, 2_000);
+}
+
+function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve(true);
+  }
+
+  return new Promise<boolean>((resolve) => {
+    const timeout = setTimeout(() => {
+      child.off("exit", handleExit);
+      resolve(false);
+    }, timeoutMs);
+    timeout.unref();
+
+    const handleExit = () => {
+      clearTimeout(timeout);
+      resolve(true);
+    };
+
+    child.once("exit", handleExit);
+  });
 }

@@ -123,6 +123,7 @@ export class MessageBroker {
         s: BROKER_NAME,
         t: message.s,
         c: "discovery:result",
+        i: message.i,
         m: { services, requestId: message.i },
       }),
     );
@@ -163,6 +164,7 @@ export class MessageBroker {
         s: BROKER_NAME,
         t: target,
         c: "error",
+        i: requestId,
         m: { reason, requestId },
       }),
     );
